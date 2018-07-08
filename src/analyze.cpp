@@ -25,6 +25,7 @@ static void resolve_struct_type(CodeGen *g, TypeTableEntry *struct_type);
 static void resolve_struct_zero_bits(CodeGen *g, TypeTableEntry *struct_type);
 static void resolve_enum_zero_bits(CodeGen *g, TypeTableEntry *enum_type);
 static void resolve_union_zero_bits(CodeGen *g, TypeTableEntry *union_type);
+static void analyze_fn_body(CodeGen *g, FnTableEntry *fn_table_entry);
 
 ErrorMsg *add_node_error(CodeGen *g, AstNode *node, Buf *msg) {
     if (node->owner->c_import_node != nullptr) {
@@ -156,6 +157,14 @@ ScopeLoop *create_loop_scope(AstNode *node, Scope *parent) {
     return scope;
 }
 
+ScopeSuspend *create_suspend_scope(AstNode *node, Scope *parent) {
+    assert(node->type == NodeTypeSuspend);
+    ScopeSuspend *scope = allocate<ScopeSuspend>(1);
+    init_scope(&scope->base, ScopeIdSuspend, node, parent);
+    scope->name = node->data.suspend.name;
+    return scope;
+}
+
 ScopeFnDef *create_fndef_scope(AstNode *node, Scope *parent, FnTableEntry *fn_entry) {
     ScopeFnDef *scope = allocate<ScopeFnDef>(1);
     init_scope(&scope->base, ScopeIdFnDef, node, parent);
@@ -167,6 +176,12 @@ Scope *create_comptime_scope(AstNode *node, Scope *parent) {
     assert(node->type == NodeTypeCompTime || node->type == NodeTypeSwitchExpr);
     ScopeCompTime *scope = allocate<ScopeCompTime>(1);
     init_scope(&scope->base, ScopeIdCompTime, node, parent);
+    return &scope->base;
+}
+
+Scope *create_coro_prelude_scope(AstNode *node, Scope *parent) {
+    ScopeCoroPrelude *scope = allocate<ScopeCoroPrelude>(1);
+    init_scope(&scope->base, ScopeIdCoroPrelude, node, parent);
     return &scope->base;
 }
 
@@ -197,6 +212,43 @@ static uint8_t bits_needed_for_unsigned(uint64_t x) {
     return (upper >= x) ? base : (base + 1);
 }
 
+AstNode *type_decl_node(TypeTableEntry *type_entry) {
+    switch (type_entry->id) {
+        case TypeTableEntryIdInvalid:
+            zig_unreachable();
+        case TypeTableEntryIdStruct:
+            return type_entry->data.structure.decl_node;
+        case TypeTableEntryIdEnum:
+            return type_entry->data.enumeration.decl_node;
+        case TypeTableEntryIdUnion:
+            return type_entry->data.unionation.decl_node;
+        case TypeTableEntryIdOpaque:
+        case TypeTableEntryIdMetaType:
+        case TypeTableEntryIdVoid:
+        case TypeTableEntryIdBool:
+        case TypeTableEntryIdUnreachable:
+        case TypeTableEntryIdInt:
+        case TypeTableEntryIdFloat:
+        case TypeTableEntryIdPointer:
+        case TypeTableEntryIdArray:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
+        case TypeTableEntryIdOptional:
+        case TypeTableEntryIdErrorUnion:
+        case TypeTableEntryIdErrorSet:
+        case TypeTableEntryIdFn:
+        case TypeTableEntryIdNamespace:
+        case TypeTableEntryIdBlock:
+        case TypeTableEntryIdBoundFn:
+        case TypeTableEntryIdArgTuple:
+        case TypeTableEntryIdPromise:
+            return nullptr;
+    }
+    zig_unreachable();
+}
+
 bool type_is_complete(TypeTableEntry *type_entry) {
     switch (type_entry->id) {
         case TypeTableEntryIdInvalid:
@@ -217,11 +269,11 @@ bool type_is_complete(TypeTableEntry *type_entry) {
         case TypeTableEntryIdFloat:
         case TypeTableEntryIdPointer:
         case TypeTableEntryIdArray:
-        case TypeTableEntryIdNumLitFloat:
-        case TypeTableEntryIdNumLitInt:
-        case TypeTableEntryIdUndefLit:
-        case TypeTableEntryIdNullLit:
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
+        case TypeTableEntryIdOptional:
         case TypeTableEntryIdErrorUnion:
         case TypeTableEntryIdErrorSet:
         case TypeTableEntryIdFn:
@@ -253,11 +305,11 @@ bool type_has_zero_bits_known(TypeTableEntry *type_entry) {
         case TypeTableEntryIdFloat:
         case TypeTableEntryIdPointer:
         case TypeTableEntryIdArray:
-        case TypeTableEntryIdNumLitFloat:
-        case TypeTableEntryIdNumLitInt:
-        case TypeTableEntryIdUndefLit:
-        case TypeTableEntryIdNullLit:
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
+        case TypeTableEntryIdOptional:
         case TypeTableEntryIdErrorUnion:
         case TypeTableEntryIdErrorSet:
         case TypeTableEntryIdFn:
@@ -366,14 +418,15 @@ TypeTableEntry *get_promise_type(CodeGen *g, TypeTableEntry *result_type) {
 }
 
 TypeTableEntry *get_pointer_to_type_extra(CodeGen *g, TypeTableEntry *child_type, bool is_const,
-        bool is_volatile, uint32_t byte_alignment, uint32_t bit_offset, uint32_t unaligned_bit_count)
+        bool is_volatile, PtrLen ptr_len, uint32_t byte_alignment, uint32_t bit_offset, uint32_t unaligned_bit_count)
 {
     assert(!type_is_invalid(child_type));
+    assert(ptr_len == PtrLenSingle || child_type->id != TypeTableEntryIdOpaque);
 
     TypeId type_id = {};
     TypeTableEntry **parent_pointer = nullptr;
     uint32_t abi_alignment = get_abi_alignment(g, child_type);
-    if (unaligned_bit_count != 0 || is_volatile || byte_alignment != abi_alignment) {
+    if (unaligned_bit_count != 0 || is_volatile || byte_alignment != abi_alignment || ptr_len != PtrLenSingle) {
         type_id.id = TypeTableEntryIdPointer;
         type_id.data.pointer.child_type = child_type;
         type_id.data.pointer.is_const = is_const;
@@ -381,6 +434,7 @@ TypeTableEntry *get_pointer_to_type_extra(CodeGen *g, TypeTableEntry *child_type
         type_id.data.pointer.alignment = byte_alignment;
         type_id.data.pointer.bit_offset = bit_offset;
         type_id.data.pointer.unaligned_bit_count = unaligned_bit_count;
+        type_id.data.pointer.ptr_len = ptr_len;
 
         auto existing_entry = g->type_table.maybe_get(type_id);
         if (existing_entry)
@@ -398,18 +452,18 @@ TypeTableEntry *get_pointer_to_type_extra(CodeGen *g, TypeTableEntry *child_type
 
     TypeTableEntry *entry = new_type_table_entry(TypeTableEntryIdPointer);
     entry->is_copyable = true;
-    entry->can_mutate_state_through_it = is_const ? child_type->can_mutate_state_through_it : true;
 
+    const char *star_str = ptr_len == PtrLenSingle ? "*" : "[*]";
     const char *const_str = is_const ? "const " : "";
     const char *volatile_str = is_volatile ? "volatile " : "";
     buf_resize(&entry->name, 0);
     if (unaligned_bit_count == 0 && byte_alignment == abi_alignment) {
-        buf_appendf(&entry->name, "&%s%s%s", const_str, volatile_str, buf_ptr(&child_type->name));
+        buf_appendf(&entry->name, "%s%s%s%s", star_str, const_str, volatile_str, buf_ptr(&child_type->name));
     } else if (unaligned_bit_count == 0) {
-        buf_appendf(&entry->name, "&align(%" PRIu32 ") %s%s%s", byte_alignment,
+        buf_appendf(&entry->name, "%salign(%" PRIu32 ") %s%s%s", star_str, byte_alignment,
                 const_str, volatile_str, buf_ptr(&child_type->name));
     } else {
-        buf_appendf(&entry->name, "&align(%" PRIu32 ":%" PRIu32 ":%" PRIu32 ") %s%s%s", byte_alignment,
+        buf_appendf(&entry->name, "%salign(%" PRIu32 ":%" PRIu32 ":%" PRIu32 ") %s%s%s", star_str, byte_alignment,
                 bit_offset, bit_offset + unaligned_bit_count, const_str, volatile_str, buf_ptr(&child_type->name));
     }
 
@@ -419,7 +473,9 @@ TypeTableEntry *get_pointer_to_type_extra(CodeGen *g, TypeTableEntry *child_type
 
     if (!entry->zero_bits) {
         assert(byte_alignment > 0);
-        if (is_const || is_volatile || unaligned_bit_count != 0 || byte_alignment != abi_alignment) {
+        if (is_const || is_volatile || unaligned_bit_count != 0 || byte_alignment != abi_alignment ||
+            ptr_len != PtrLenSingle)
+        {
             TypeTableEntry *peer_type = get_pointer_to_type(g, child_type, false);
             entry->type_ref = peer_type->type_ref;
             entry->di_type = peer_type->di_type;
@@ -437,6 +493,7 @@ TypeTableEntry *get_pointer_to_type_extra(CodeGen *g, TypeTableEntry *child_type
         entry->di_type = g->builtin_types.entry_void->di_type;
     }
 
+    entry->data.pointer.ptr_len = ptr_len;
     entry->data.pointer.child_type = child_type;
     entry->data.pointer.is_const = is_const;
     entry->data.pointer.is_volatile = is_volatile;
@@ -453,7 +510,8 @@ TypeTableEntry *get_pointer_to_type_extra(CodeGen *g, TypeTableEntry *child_type
 }
 
 TypeTableEntry *get_pointer_to_type(CodeGen *g, TypeTableEntry *child_type, bool is_const) {
-    return get_pointer_to_type_extra(g, child_type, is_const, false, get_abi_alignment(g, child_type), 0, 0);
+    return get_pointer_to_type_extra(g, child_type, is_const, false, PtrLenSingle,
+            get_abi_alignment(g, child_type), 0, 0);
 }
 
 TypeTableEntry *get_promise_frame_type(CodeGen *g, TypeTableEntry *return_type) {
@@ -461,29 +519,47 @@ TypeTableEntry *get_promise_frame_type(CodeGen *g, TypeTableEntry *return_type) 
         return return_type->promise_frame_parent;
     }
 
-    TypeTableEntry *awaiter_handle_type = get_maybe_type(g, g->builtin_types.entry_promise);
+    TypeTableEntry *awaiter_handle_type = get_optional_type(g, g->builtin_types.entry_promise);
     TypeTableEntry *result_ptr_type = get_pointer_to_type(g, return_type, false);
-    const char *field_names[] = {AWAITER_HANDLE_FIELD_NAME, RESULT_FIELD_NAME, RESULT_PTR_FIELD_NAME};
-    TypeTableEntry *field_types[] = {awaiter_handle_type, return_type, result_ptr_type};
+
+    ZigList<const char *> field_names = {};
+    field_names.append(AWAITER_HANDLE_FIELD_NAME);
+    field_names.append(RESULT_FIELD_NAME);
+    field_names.append(RESULT_PTR_FIELD_NAME);
+    if (g->have_err_ret_tracing) {
+        field_names.append(ERR_RET_TRACE_PTR_FIELD_NAME);
+        field_names.append(ERR_RET_TRACE_FIELD_NAME);
+        field_names.append(RETURN_ADDRESSES_FIELD_NAME);
+    }
+
+    ZigList<TypeTableEntry *> field_types = {};
+    field_types.append(awaiter_handle_type);
+    field_types.append(return_type);
+    field_types.append(result_ptr_type);
+    if (g->have_err_ret_tracing) {
+        field_types.append(get_ptr_to_stack_trace_type(g));
+        field_types.append(g->stack_trace_type);
+        field_types.append(get_array_type(g, g->builtin_types.entry_usize, stack_trace_ptr_count));
+    }
+
+    assert(field_names.length == field_types.length);
     Buf *name = buf_sprintf("AsyncFramePromise(%s)", buf_ptr(&return_type->name));
-    TypeTableEntry *entry = get_struct_type(g, buf_ptr(name), field_names, field_types, 3);
+    TypeTableEntry *entry = get_struct_type(g, buf_ptr(name), field_names.items, field_types.items, field_names.length);
 
     return_type->promise_frame_parent = entry;
     return entry;
 }
 
-TypeTableEntry *get_maybe_type(CodeGen *g, TypeTableEntry *child_type) {
-    if (child_type->maybe_parent) {
-        TypeTableEntry *entry = child_type->maybe_parent;
+TypeTableEntry *get_optional_type(CodeGen *g, TypeTableEntry *child_type) {
+    if (child_type->optional_parent) {
+        TypeTableEntry *entry = child_type->optional_parent;
         return entry;
     } else {
         ensure_complete_type(g, child_type);
 
-        TypeTableEntry *entry = new_type_table_entry(TypeTableEntryIdMaybe);
+        TypeTableEntry *entry = new_type_table_entry(TypeTableEntryIdOptional);
         assert(child_type->type_ref || child_type->zero_bits);
-        assert(child_type->di_type);
         entry->is_copyable = type_is_copyable(g, child_type);
-        entry->can_mutate_state_through_it = child_type->can_mutate_state_through_it;
 
         buf_resize(&entry->name, 0);
         buf_appendf(&entry->name, "?%s", buf_ptr(&child_type->name));
@@ -492,12 +568,14 @@ TypeTableEntry *get_maybe_type(CodeGen *g, TypeTableEntry *child_type) {
             entry->type_ref = LLVMInt1Type();
             entry->di_type = g->builtin_types.entry_bool->di_type;
         } else if (type_is_codegen_pointer(child_type)) {
+            assert(child_type->di_type);
             // this is an optimization but also is necessary for calling C
             // functions where all pointers are maybe pointers
             // function types are technically pointers
             entry->type_ref = child_type->type_ref;
             entry->di_type = child_type->di_type;
         } else {
+            assert(child_type->di_type);
             // create a struct with a boolean whether this is the null value
             LLVMTypeRef elem_types[] = {
                 child_type->type_ref,
@@ -551,7 +629,7 @@ TypeTableEntry *get_maybe_type(CodeGen *g, TypeTableEntry *child_type) {
 
         entry->data.maybe.child_type = child_type;
 
-        child_type->maybe_parent = entry;
+        child_type->optional_parent = entry;
         return entry;
     }
 }
@@ -574,7 +652,6 @@ TypeTableEntry *get_error_union_type(CodeGen *g, TypeTableEntry *err_set_type, T
     entry->is_copyable = true;
     assert(payload_type->di_type);
     ensure_complete_type(g, payload_type);
-    entry->can_mutate_state_through_it = payload_type->can_mutate_state_through_it;
 
     buf_resize(&entry->name, 0);
     buf_appendf(&entry->name, "%s!%s", buf_ptr(&err_set_type->name), buf_ptr(&payload_type->name));
@@ -725,6 +802,7 @@ static void slice_type_common_init(CodeGen *g, TypeTableEntry *pointer_type, Typ
 
 TypeTableEntry *get_slice_type(CodeGen *g, TypeTableEntry *ptr_type) {
     assert(ptr_type->id == TypeTableEntryIdPointer);
+    assert(ptr_type->data.pointer.ptr_len == PtrLenUnknown);
 
     TypeTableEntry **parent_pointer = &ptr_type->data.pointer.slice_parent;
     if (*parent_pointer) {
@@ -733,18 +811,19 @@ TypeTableEntry *get_slice_type(CodeGen *g, TypeTableEntry *ptr_type) {
 
     TypeTableEntry *entry = new_type_table_entry(TypeTableEntryIdStruct);
     entry->is_copyable = true;
-    entry->can_mutate_state_through_it = ptr_type->can_mutate_state_through_it;
 
     // replace the & with [] to go from a ptr type name to a slice type name
     buf_resize(&entry->name, 0);
-    buf_appendf(&entry->name, "[]%s", buf_ptr(&ptr_type->name) + 1);
+    size_t name_offset = (ptr_type->data.pointer.ptr_len == PtrLenSingle) ? 1 : 3;
+    buf_appendf(&entry->name, "[]%s", buf_ptr(&ptr_type->name) + name_offset);
 
     TypeTableEntry *child_type = ptr_type->data.pointer.child_type;
-    uint32_t abi_alignment;
+    uint32_t abi_alignment = get_abi_alignment(g, child_type);
     if (ptr_type->data.pointer.is_const || ptr_type->data.pointer.is_volatile ||
-        ptr_type->data.pointer.alignment != (abi_alignment = get_abi_alignment(g, child_type)))
+        ptr_type->data.pointer.alignment != abi_alignment)
     {
-        TypeTableEntry *peer_ptr_type = get_pointer_to_type(g, child_type, false);
+        TypeTableEntry *peer_ptr_type = get_pointer_to_type_extra(g, child_type, false, false,
+                PtrLenUnknown, abi_alignment, 0, 0);
         TypeTableEntry *peer_slice_type = get_slice_type(g, peer_ptr_type);
 
         slice_type_common_init(g, ptr_type, entry);
@@ -768,9 +847,11 @@ TypeTableEntry *get_slice_type(CodeGen *g, TypeTableEntry *ptr_type) {
         if (child_ptr_type->data.pointer.is_const || child_ptr_type->data.pointer.is_volatile ||
             child_ptr_type->data.pointer.alignment != get_abi_alignment(g, grand_child_type))
         {
-            TypeTableEntry *bland_child_ptr_type = get_pointer_to_type(g, grand_child_type, false);
+            TypeTableEntry *bland_child_ptr_type = get_pointer_to_type_extra(g, grand_child_type, false, false,
+                    PtrLenUnknown, get_abi_alignment(g, grand_child_type), 0, 0);
             TypeTableEntry *bland_child_slice = get_slice_type(g, bland_child_ptr_type);
-            TypeTableEntry *peer_ptr_type = get_pointer_to_type(g, bland_child_slice, false);
+            TypeTableEntry *peer_ptr_type = get_pointer_to_type_extra(g, bland_child_slice, false, false,
+                    PtrLenUnknown, get_abi_alignment(g, bland_child_slice), 0, 0);
             TypeTableEntry *peer_slice_type = get_slice_type(g, peer_ptr_type);
 
             entry->type_ref = peer_slice_type->type_ref;
@@ -974,7 +1055,14 @@ TypeTableEntry *get_fn_type(CodeGen *g, FnTypeId *fn_type_id) {
     if (table_entry) {
         return table_entry->value;
     }
-    ensure_complete_type(g, fn_type_id->return_type);
+    if (fn_type_id->return_type != nullptr) {
+        ensure_complete_type(g, fn_type_id->return_type);
+        if (type_is_invalid(fn_type_id->return_type))
+            return g->builtin_types.entry_invalid;
+        assert(fn_type_id->return_type->id != TypeTableEntryIdOpaque);
+    } else {
+        zig_panic("TODO implement inferred return types https://github.com/ziglang/zig/issues/447");
+    }
 
     TypeTableEntry *fn_type = new_type_table_entry(TypeTableEntryIdFn);
     fn_type->is_copyable = true;
@@ -985,7 +1073,8 @@ TypeTableEntry *get_fn_type(CodeGen *g, FnTypeId *fn_type_id) {
     // populate the name of the type
     buf_resize(&fn_type->name, 0);
     if (fn_type->data.fn.fn_type_id.cc == CallingConventionAsync) {
-        buf_appendf(&fn_type->name, "async(%s) ", buf_ptr(&fn_type_id->async_allocator_type->name));
+        assert(fn_type_id->async_allocator_type != nullptr);
+        buf_appendf(&fn_type->name, "async<%s> ", buf_ptr(&fn_type_id->async_allocator_type->name));
     } else {
         const char *cc_str = calling_convention_fn_type_str(fn_type->data.fn.fn_type_id.cc);
         buf_appendf(&fn_type->name, "%s", cc_str);
@@ -1084,7 +1173,10 @@ TypeTableEntry *get_fn_type(CodeGen *g, FnTypeId *fn_type_id) {
             gen_param_info->src_index = i;
             gen_param_info->gen_index = SIZE_MAX;
 
-            type_ensure_zero_bits_known(g, type_entry);
+            ensure_complete_type(g, type_entry);
+            if (type_is_invalid(type_entry))
+                return g->builtin_types.entry_invalid;
+
             if (type_has_bits(type_entry)) {
                 TypeTableEntry *gen_type;
                 if (handle_is_ptr(type_entry)) {
@@ -1223,7 +1315,7 @@ void init_fn_type_id(FnTypeId *fn_type_id, AstNode *proto_node, size_t param_cou
     }
 
     fn_type_id->param_count = fn_proto->params.length;
-    fn_type_id->param_info = allocate_nonzero<FnTypeParamInfo>(param_count_alloc);
+    fn_type_id->param_info = allocate<FnTypeParamInfo>(param_count_alloc);
     fn_type_id->next_param_index = 0;
     fn_type_id->is_var_args = fn_proto->is_var_args;
 }
@@ -1248,7 +1340,8 @@ static bool analyze_const_align(CodeGen *g, Scope *scope, AstNode *node, uint32_
 }
 
 static bool analyze_const_string(CodeGen *g, Scope *scope, AstNode *node, Buf **out_buffer) {
-    TypeTableEntry *ptr_type = get_pointer_to_type(g, g->builtin_types.entry_u8, true);
+    TypeTableEntry *ptr_type = get_pointer_to_type_extra(g, g->builtin_types.entry_u8, true, false,
+            PtrLenUnknown, get_abi_alignment(g, g->builtin_types.entry_u8), 0, 0);
     TypeTableEntry *str_type = get_slice_type(g, ptr_type);
     IrInstruction *instr = analyze_const_value(g, scope, node, str_type, nullptr);
     if (type_is_invalid(instr->value.type))
@@ -1285,10 +1378,10 @@ static bool type_allowed_in_packed_struct(TypeTableEntry *type_entry) {
             zig_unreachable();
         case TypeTableEntryIdMetaType:
         case TypeTableEntryIdUnreachable:
-        case TypeTableEntryIdNumLitFloat:
-        case TypeTableEntryIdNumLitInt:
-        case TypeTableEntryIdUndefLit:
-        case TypeTableEntryIdNullLit:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
         case TypeTableEntryIdErrorUnion:
         case TypeTableEntryIdErrorSet:
         case TypeTableEntryIdNamespace:
@@ -1310,7 +1403,7 @@ static bool type_allowed_in_packed_struct(TypeTableEntry *type_entry) {
             return type_entry->data.structure.layout == ContainerLayoutPacked;
         case TypeTableEntryIdUnion:
             return type_entry->data.unionation.layout == ContainerLayoutPacked;
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdOptional:
             {
                 TypeTableEntry *child_type = type_entry->data.maybe.child_type;
                 return type_is_codegen_pointer(child_type);
@@ -1326,10 +1419,10 @@ static bool type_allowed_in_extern(CodeGen *g, TypeTableEntry *type_entry) {
         case TypeTableEntryIdInvalid:
             zig_unreachable();
         case TypeTableEntryIdMetaType:
-        case TypeTableEntryIdNumLitFloat:
-        case TypeTableEntryIdNumLitInt:
-        case TypeTableEntryIdUndefLit:
-        case TypeTableEntryIdNullLit:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
         case TypeTableEntryIdErrorUnion:
         case TypeTableEntryIdErrorSet:
         case TypeTableEntryIdNamespace:
@@ -1364,7 +1457,7 @@ static bool type_allowed_in_extern(CodeGen *g, TypeTableEntry *type_entry) {
             return type_allowed_in_extern(g, type_entry->data.pointer.child_type);
         case TypeTableEntryIdStruct:
             return type_entry->data.structure.layout == ContainerLayoutExtern || type_entry->data.structure.layout == ContainerLayoutPacked;
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdOptional:
             {
                 TypeTableEntry *child_type = type_entry->data.maybe.child_type;
                 return child_type->id == TypeTableEntryIdPointer || child_type->id == TypeTableEntryIdFn;
@@ -1414,6 +1507,17 @@ static TypeTableEntry *analyze_fn_type(CodeGen *g, AstNode *proto_node, Scope *c
                             calling_convention_name(fn_type_id.cc)));
                 return g->builtin_types.entry_invalid;
             }
+            if (param_node->data.param_decl.type != nullptr) {
+                TypeTableEntry *type_entry = analyze_type_expr(g, child_scope, param_node->data.param_decl.type);
+                if (type_is_invalid(type_entry)) {
+                    return g->builtin_types.entry_invalid;
+                }
+                FnTypeParamInfo *param_info = &fn_type_id.param_info[fn_type_id.next_param_index];
+                param_info->type = type_entry;
+                param_info->is_noalias = param_node->data.param_decl.is_noalias;
+                fn_type_id.next_param_index += 1;
+            }
+
             return get_generic_fn_type(g, &fn_type_id);
         } else if (param_is_var_args) {
             if (fn_type_id.cc == CallingConventionC) {
@@ -1463,15 +1567,15 @@ static TypeTableEntry *analyze_fn_type(CodeGen *g, AstNode *proto_node, Scope *c
             case TypeTableEntryIdInvalid:
                 return g->builtin_types.entry_invalid;
             case TypeTableEntryIdUnreachable:
-            case TypeTableEntryIdUndefLit:
-            case TypeTableEntryIdNullLit:
+            case TypeTableEntryIdUndefined:
+            case TypeTableEntryIdNull:
             case TypeTableEntryIdArgTuple:
             case TypeTableEntryIdOpaque:
                 add_node_error(g, param_node->data.param_decl.type,
                     buf_sprintf("parameter of type '%s' not allowed", buf_ptr(&type_entry->name)));
                 return g->builtin_types.entry_invalid;
-            case TypeTableEntryIdNumLitFloat:
-            case TypeTableEntryIdNumLitInt:
+            case TypeTableEntryIdComptimeFloat:
+            case TypeTableEntryIdComptimeInt:
             case TypeTableEntryIdNamespace:
             case TypeTableEntryIdBlock:
             case TypeTableEntryIdBoundFn:
@@ -1487,19 +1591,13 @@ static TypeTableEntry *analyze_fn_type(CodeGen *g, AstNode *proto_node, Scope *c
             case TypeTableEntryIdPointer:
             case TypeTableEntryIdArray:
             case TypeTableEntryIdStruct:
-            case TypeTableEntryIdMaybe:
+            case TypeTableEntryIdOptional:
             case TypeTableEntryIdErrorUnion:
             case TypeTableEntryIdErrorSet:
             case TypeTableEntryIdEnum:
             case TypeTableEntryIdUnion:
             case TypeTableEntryIdFn:
             case TypeTableEntryIdPromise:
-                ensure_complete_type(g, type_entry);
-                if (calling_convention_allows_zig_types(fn_type_id.cc) && !type_is_copyable(g, type_entry)) {
-                    add_node_error(g, param_node->data.param_decl.type,
-                        buf_sprintf("type '%s' is not copyable; cannot pass by value", buf_ptr(&type_entry->name)));
-                    return g->builtin_types.entry_invalid;
-                }
                 break;
         }
         FnTypeParamInfo *param_info = &fn_type_id.param_info[fn_type_id.next_param_index];
@@ -1521,7 +1619,7 @@ static TypeTableEntry *analyze_fn_type(CodeGen *g, AstNode *proto_node, Scope *c
             return g->builtin_types.entry_invalid;
         }
         add_node_error(g, proto_node,
-            buf_sprintf("TODO implement inferred return types https://github.com/zig-lang/zig/issues/447"));
+            buf_sprintf("TODO implement inferred return types https://github.com/ziglang/zig/issues/447"));
         return g->builtin_types.entry_invalid;
         //return get_generic_fn_type(g, &fn_type_id);
     }
@@ -1551,16 +1649,16 @@ static TypeTableEntry *analyze_fn_type(CodeGen *g, AstNode *proto_node, Scope *c
         case TypeTableEntryIdInvalid:
             zig_unreachable();
 
-        case TypeTableEntryIdUndefLit:
-        case TypeTableEntryIdNullLit:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
         case TypeTableEntryIdArgTuple:
         case TypeTableEntryIdOpaque:
             add_node_error(g, fn_proto->return_type,
                 buf_sprintf("return type '%s' not allowed", buf_ptr(&fn_type_id.return_type->name)));
             return g->builtin_types.entry_invalid;
 
-        case TypeTableEntryIdNumLitFloat:
-        case TypeTableEntryIdNumLitInt:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
         case TypeTableEntryIdNamespace:
         case TypeTableEntryIdBlock:
         case TypeTableEntryIdBoundFn:
@@ -1581,7 +1679,7 @@ static TypeTableEntry *analyze_fn_type(CodeGen *g, AstNode *proto_node, Scope *c
         case TypeTableEntryIdPointer:
         case TypeTableEntryIdArray:
         case TypeTableEntryIdStruct:
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdOptional:
         case TypeTableEntryIdErrorUnion:
         case TypeTableEntryIdErrorSet:
         case TypeTableEntryIdEnum:
@@ -1739,8 +1837,6 @@ TypeTableEntry *get_struct_type(CodeGen *g, const char *type_name, const char *f
             struct_type->data.structure.gen_field_count += 1;
         } else {
             field->gen_index = SIZE_MAX;
-            struct_type->can_mutate_state_through_it = struct_type->can_mutate_state_through_it ||
-                field->type_entry->can_mutate_state_through_it;
         }
 
         auto prev_entry = struct_type->data.structure.fields_by_name.put_unique(field->name, field);
@@ -1814,7 +1910,7 @@ static void resolve_struct_type(CodeGen *g, TypeTableEntry *struct_type) {
     }
 
     assert(!struct_type->data.structure.zero_bits_loop_flag);
-    assert(struct_type->data.structure.fields);
+    assert(struct_type->data.structure.fields || struct_type->data.structure.src_field_count == 0);
     assert(decl_node->type == NodeTypeContainerDecl);
 
     size_t field_count = struct_type->data.structure.src_field_count;
@@ -2259,8 +2355,9 @@ static void resolve_enum_zero_bits(CodeGen *g, TypeTableEntry *enum_type) {
         return;
 
     if (enum_type->data.enumeration.zero_bits_loop_flag) {
-        enum_type->data.enumeration.zero_bits_known = true;
-        enum_type->data.enumeration.zero_bits_loop_flag = false;
+        add_node_error(g, enum_type->data.enumeration.decl_node,
+            buf_sprintf("'%s' depends on itself", buf_ptr(&enum_type->name)));
+        enum_type->data.enumeration.is_invalid = true;
         return;
     }
 
@@ -2292,8 +2389,14 @@ static void resolve_enum_zero_bits(CodeGen *g, TypeTableEntry *enum_type) {
     HashMap<BigInt, AstNode *, bigint_hash, bigint_eql> occupied_tag_values = {};
     occupied_tag_values.init(field_count);
 
-    TypeTableEntry *tag_int_type = get_smallest_unsigned_int_type(g, field_count - 1);
+    TypeTableEntry *tag_int_type;
+    if (enum_type->data.enumeration.layout == ContainerLayoutExtern) {
+        tag_int_type = get_c_int_type(g, CIntTypeInt);
+    } else {
+        tag_int_type = get_smallest_unsigned_int_type(g, field_count - 1);
+    }
 
+    // TODO: Are extern enums allowed to have an init_arg_expr?
     if (decl_node->data.container_decl.init_arg_expr != nullptr) {
         TypeTableEntry *wanted_tag_int_type = analyze_type_expr(g, scope, decl_node->data.container_decl.init_arg_expr);
         if (type_is_invalid(wanted_tag_int_type)) {
@@ -2478,11 +2581,12 @@ static void resolve_struct_zero_bits(CodeGen *g, TypeTableEntry *struct_type) {
             continue;
         }
 
+        if (type_requires_comptime(field_type)) {
+            struct_type->data.structure.requires_comptime = true;
+        }
+
         if (!type_has_bits(field_type))
             continue;
-
-        struct_type->can_mutate_state_through_it = struct_type->can_mutate_state_through_it ||
-            field_type->can_mutate_state_through_it;
 
         if (gen_field_index == 0) {
             if (struct_type->data.structure.layout == ContainerLayoutPacked) {
@@ -2628,8 +2732,8 @@ static void resolve_union_zero_bits(CodeGen *g, TypeTableEntry *union_type) {
             return;
         }
         tag_type = enum_type;
+        abi_alignment_so_far = get_abi_alignment(g, enum_type); // this populates src_field_count
         covered_enum_fields = allocate<bool>(enum_type->data.enumeration.src_field_count);
-        abi_alignment_so_far = get_abi_alignment(g, enum_type);
     } else {
         tag_type = nullptr;
         abi_alignment_so_far = 0;
@@ -2671,8 +2775,11 @@ static void resolve_union_zero_bits(CodeGen *g, TypeTableEntry *union_type) {
             }
         }
         union_field->type_entry = field_type;
-        union_type->can_mutate_state_through_it = union_type->can_mutate_state_through_it ||
-            field_type->can_mutate_state_through_it;
+
+        if (type_requires_comptime(field_type)) {
+            union_type->data.unionation.requires_comptime = true;
+        }
+
 
         if (field_node->data.struct_field.value != nullptr && !decl_node->data.container_decl.auto_enum) {
             ErrorMsg *msg = add_node_error(g, field_node->data.struct_field.value,
@@ -2919,14 +3026,15 @@ static void typecheck_panic_fn(CodeGen *g, FnTableEntry *panic_fn) {
     if (fn_type_id->param_count != 2) {
         return wrong_panic_prototype(g, proto_node, fn_type);
     }
-    TypeTableEntry *const_u8_ptr = get_pointer_to_type(g, g->builtin_types.entry_u8, true);
+    TypeTableEntry *const_u8_ptr = get_pointer_to_type_extra(g, g->builtin_types.entry_u8, true, false,
+            PtrLenUnknown, get_abi_alignment(g, g->builtin_types.entry_u8), 0, 0);
     TypeTableEntry *const_u8_slice = get_slice_type(g, const_u8_ptr);
     if (fn_type_id->param_info[0].type != const_u8_slice) {
         return wrong_panic_prototype(g, proto_node, fn_type);
     }
 
-    TypeTableEntry *nullable_ptr_to_stack_trace_type = get_maybe_type(g, get_ptr_to_stack_trace_type(g));
-    if (fn_type_id->param_info[1].type != nullable_ptr_to_stack_trace_type) {
+    TypeTableEntry *optional_ptr_to_stack_trace_type = get_optional_type(g, get_ptr_to_stack_trace_type(g));
+    if (fn_type_id->param_info[1].type != optional_ptr_to_stack_trace_type) {
         return wrong_panic_prototype(g, proto_node, fn_type);
     }
 
@@ -3216,7 +3324,6 @@ void scan_decls(CodeGen *g, ScopeDecls *decls_scope, AstNode *node) {
             break;
         case NodeTypeContainerDecl:
         case NodeTypeParamDecl:
-        case NodeTypeFnDecl:
         case NodeTypeReturnExpr:
         case NodeTypeDefer:
         case NodeTypeBlock:
@@ -3236,7 +3343,7 @@ void scan_decls(CodeGen *g, ScopeDecls *decls_scope, AstNode *node) {
         case NodeTypeThisLiteral:
         case NodeTypeSymbol:
         case NodeTypePrefixOpExpr:
-        case NodeTypeAddrOfExpr:
+        case NodeTypePointerType:
         case NodeTypeIfBoolExpr:
         case NodeTypeWhileExpr:
         case NodeTypeForExpr:
@@ -3248,6 +3355,8 @@ void scan_decls(CodeGen *g, ScopeDecls *decls_scope, AstNode *node) {
         case NodeTypeUnreachable:
         case NodeTypeAsmExpr:
         case NodeTypeFieldAccessExpr:
+        case NodeTypePtrDeref:
+        case NodeTypeUnwrapOptional:
         case NodeTypeStructField:
         case NodeTypeContainerInitExpr:
         case NodeTypeStructValueField:
@@ -3260,6 +3369,7 @@ void scan_decls(CodeGen *g, ScopeDecls *decls_scope, AstNode *node) {
         case NodeTypeResume:
         case NodeTypeAwaitExpr:
         case NodeTypeSuspend:
+        case NodeTypePromiseType:
             zig_unreachable();
     }
 }
@@ -3288,16 +3398,16 @@ TypeTableEntry *validate_var_type(CodeGen *g, AstNode *source_node, TypeTableEnt
         case TypeTableEntryIdInvalid:
             return g->builtin_types.entry_invalid;
         case TypeTableEntryIdUnreachable:
-        case TypeTableEntryIdNumLitFloat:
-        case TypeTableEntryIdNumLitInt:
-        case TypeTableEntryIdUndefLit:
-        case TypeTableEntryIdNullLit:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
         case TypeTableEntryIdBlock:
         case TypeTableEntryIdArgTuple:
         case TypeTableEntryIdOpaque:
             add_node_error(g, source_node, buf_sprintf("variable of type '%s' not allowed",
                 buf_ptr(&type_entry->name)));
             return g->builtin_types.entry_invalid;
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
         case TypeTableEntryIdNamespace:
         case TypeTableEntryIdMetaType:
         case TypeTableEntryIdVoid:
@@ -3307,7 +3417,7 @@ TypeTableEntry *validate_var_type(CodeGen *g, AstNode *source_node, TypeTableEnt
         case TypeTableEntryIdPointer:
         case TypeTableEntryIdArray:
         case TypeTableEntryIdStruct:
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdOptional:
         case TypeTableEntryIdErrorUnion:
         case TypeTableEntryIdErrorSet:
         case TypeTableEntryIdEnum:
@@ -3431,12 +3541,12 @@ static void resolve_decl_var(CodeGen *g, TldVar *tld_var) {
             add_node_error(g, source_node, buf_sprintf("variable initialization is unreachable"));
             implicit_type = g->builtin_types.entry_invalid;
         } else if ((!is_const || linkage == VarLinkageExternal) &&
-                (implicit_type->id == TypeTableEntryIdNumLitFloat ||
-                implicit_type->id == TypeTableEntryIdNumLitInt))
+                (implicit_type->id == TypeTableEntryIdComptimeFloat ||
+                implicit_type->id == TypeTableEntryIdComptimeInt))
         {
             add_node_error(g, source_node, buf_sprintf("unable to infer variable type"));
             implicit_type = g->builtin_types.entry_invalid;
-        } else if (implicit_type->id == TypeTableEntryIdNullLit) {
+        } else if (implicit_type->id == TypeTableEntryIdNull) {
             add_node_error(g, source_node, buf_sprintf("unable to infer variable type"));
             implicit_type = g->builtin_types.entry_invalid;
         } else if (implicit_type->id == TypeTableEntryIdMetaType && !is_const) {
@@ -3596,7 +3706,9 @@ FnTableEntry *scope_get_fn_if_root(Scope *scope) {
             case ScopeIdVarDecl:
             case ScopeIdCImport:
             case ScopeIdLoop:
+            case ScopeIdSuspend:
             case ScopeIdCompTime:
+            case ScopeIdCoroPrelude:
                 scope = scope->parent;
                 continue;
             case ScopeIdFnDef:
@@ -3653,6 +3765,7 @@ TypeUnionField *find_union_field_by_tag(TypeTableEntry *type_entry, const BigInt
 }
 
 TypeEnumField *find_enum_field_by_tag(TypeTableEntry *enum_type, const BigInt *tag) {
+    assert(enum_type->data.enumeration.zero_bits_known);
     for (uint32_t i = 0; i < enum_type->data.enumeration.src_field_count; i += 1) {
         TypeEnumField *field = &enum_type->data.enumeration.fields[i];
         if (bigint_cmp(&field->value, tag) == CmpEQ) {
@@ -3679,11 +3792,11 @@ static bool is_container(TypeTableEntry *type_entry) {
         case TypeTableEntryIdInt:
         case TypeTableEntryIdFloat:
         case TypeTableEntryIdArray:
-        case TypeTableEntryIdNumLitFloat:
-        case TypeTableEntryIdNumLitInt:
-        case TypeTableEntryIdUndefLit:
-        case TypeTableEntryIdNullLit:
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
+        case TypeTableEntryIdOptional:
         case TypeTableEntryIdErrorUnion:
         case TypeTableEntryIdErrorSet:
         case TypeTableEntryIdFn:
@@ -3698,14 +3811,24 @@ static bool is_container(TypeTableEntry *type_entry) {
     zig_unreachable();
 }
 
+bool is_ref(TypeTableEntry *type_entry) {
+    return type_entry->id == TypeTableEntryIdPointer && type_entry->data.pointer.ptr_len == PtrLenSingle;
+}
+
+bool is_array_ref(TypeTableEntry *type_entry) {
+    TypeTableEntry *array = is_ref(type_entry) ?
+        type_entry->data.pointer.child_type : type_entry;
+    return array->id == TypeTableEntryIdArray;
+}
+
 bool is_container_ref(TypeTableEntry *type_entry) {
-    return (type_entry->id == TypeTableEntryIdPointer) ?
+    return is_ref(type_entry) ?
         is_container(type_entry->data.pointer.child_type) : is_container(type_entry);
 }
 
 TypeTableEntry *container_ref_type(TypeTableEntry *type_entry) {
     assert(is_container_ref(type_entry));
-    return (type_entry->id == TypeTableEntryIdPointer) ?
+    return is_ref(type_entry) ?
         type_entry->data.pointer.child_type : type_entry;
 }
 
@@ -3728,11 +3851,11 @@ void resolve_container_type(CodeGen *g, TypeTableEntry *type_entry) {
         case TypeTableEntryIdInt:
         case TypeTableEntryIdFloat:
         case TypeTableEntryIdArray:
-        case TypeTableEntryIdNumLitFloat:
-        case TypeTableEntryIdNumLitInt:
-        case TypeTableEntryIdUndefLit:
-        case TypeTableEntryIdNullLit:
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
+        case TypeTableEntryIdOptional:
         case TypeTableEntryIdErrorUnion:
         case TypeTableEntryIdErrorSet:
         case TypeTableEntryIdFn:
@@ -3751,7 +3874,7 @@ TypeTableEntry *get_codegen_ptr_type(TypeTableEntry *type) {
     if (type->id == TypeTableEntryIdPointer) return type;
     if (type->id == TypeTableEntryIdFn) return type;
     if (type->id == TypeTableEntryIdPromise) return type;
-    if (type->id == TypeTableEntryIdMaybe) {
+    if (type->id == TypeTableEntryIdOptional) {
         if (type->data.maybe.child_type->id == TypeTableEntryIdPointer) return type->data.maybe.child_type;
         if (type->data.maybe.child_type->id == TypeTableEntryIdFn) return type->data.maybe.child_type;
         if (type->data.maybe.child_type->id == TypeTableEntryIdPromise) return type->data.maybe.child_type;
@@ -3843,7 +3966,7 @@ static void define_local_param_variables(CodeGen *g, FnTableEntry *fn_table_entr
     }
 }
 
-static bool analyze_resolve_inferred_error_set(CodeGen *g, TypeTableEntry *err_set_type, AstNode *source_node) {
+bool resolve_inferred_error_set(CodeGen *g, TypeTableEntry *err_set_type, AstNode *source_node) {
     FnTableEntry *infer_fn = err_set_type->data.error_set.infer_fn;
     if (infer_fn != nullptr) {
         if (infer_fn->anal_state == FnAnalStateInvalid) {
@@ -3871,7 +3994,7 @@ void analyze_fn_ir(CodeGen *g, FnTableEntry *fn_table_entry, AstNode *return_typ
 
     TypeTableEntry *block_return_type = ir_analyze(g, &fn_table_entry->ir_executable,
             &fn_table_entry->analyzed_executable, fn_type_id->return_type, return_type_node);
-    fn_table_entry->implicit_return_type = block_return_type;
+    fn_table_entry->src_implicit_return_type = block_return_type;
 
     if (type_is_invalid(block_return_type) || fn_table_entry->analyzed_executable.invalid) {
         assert(g->errors.length > 0);
@@ -3883,10 +4006,10 @@ void analyze_fn_ir(CodeGen *g, FnTableEntry *fn_table_entry, AstNode *return_typ
         TypeTableEntry *return_err_set_type = fn_type_id->return_type->data.error_union.err_set_type;
         if (return_err_set_type->data.error_set.infer_fn != nullptr) {
             TypeTableEntry *inferred_err_set_type;
-            if (fn_table_entry->implicit_return_type->id == TypeTableEntryIdErrorSet) {
-                inferred_err_set_type = fn_table_entry->implicit_return_type;
-            } else if (fn_table_entry->implicit_return_type->id == TypeTableEntryIdErrorUnion) {
-                inferred_err_set_type = fn_table_entry->implicit_return_type->data.error_union.err_set_type;
+            if (fn_table_entry->src_implicit_return_type->id == TypeTableEntryIdErrorSet) {
+                inferred_err_set_type = fn_table_entry->src_implicit_return_type;
+            } else if (fn_table_entry->src_implicit_return_type->id == TypeTableEntryIdErrorUnion) {
+                inferred_err_set_type = fn_table_entry->src_implicit_return_type->data.error_union.err_set_type;
             } else {
                 add_node_error(g, return_type_node,
                         buf_sprintf("function with inferred error set must return at least one possible error"));
@@ -3895,7 +4018,7 @@ void analyze_fn_ir(CodeGen *g, FnTableEntry *fn_table_entry, AstNode *return_typ
             }
 
             if (inferred_err_set_type->data.error_set.infer_fn != nullptr) {
-                if (!analyze_resolve_inferred_error_set(g, inferred_err_set_type, return_type_node)) {
+                if (!resolve_inferred_error_set(g, inferred_err_set_type, return_type_node)) {
                     fn_table_entry->anal_state = FnAnalStateInvalid;
                     return;
                 }
@@ -3925,7 +4048,7 @@ void analyze_fn_ir(CodeGen *g, FnTableEntry *fn_table_entry, AstNode *return_typ
     fn_table_entry->anal_state = FnAnalStateComplete;
 }
 
-void analyze_fn_body(CodeGen *g, FnTableEntry *fn_table_entry) {
+static void analyze_fn_body(CodeGen *g, FnTableEntry *fn_table_entry) {
     assert(fn_table_entry->anal_state != FnAnalStateProbing);
     if (fn_table_entry->anal_state != FnAnalStateReady)
         return;
@@ -4232,10 +4355,10 @@ bool handle_is_ptr(TypeTableEntry *type_entry) {
     switch (type_entry->id) {
         case TypeTableEntryIdInvalid:
         case TypeTableEntryIdMetaType:
-        case TypeTableEntryIdNumLitFloat:
-        case TypeTableEntryIdNumLitInt:
-        case TypeTableEntryIdUndefLit:
-        case TypeTableEntryIdNullLit:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
         case TypeTableEntryIdNamespace:
         case TypeTableEntryIdBlock:
         case TypeTableEntryIdBoundFn:
@@ -4258,7 +4381,7 @@ bool handle_is_ptr(TypeTableEntry *type_entry) {
              return type_has_bits(type_entry);
         case TypeTableEntryIdErrorUnion:
              return type_has_bits(type_entry->data.error_union.payload_type);
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdOptional:
              return type_has_bits(type_entry->data.maybe.child_type) &&
                     !type_is_codegen_pointer(type_entry->data.maybe.child_type);
         case TypeTableEntryIdUnion:
@@ -4276,68 +4399,170 @@ bool handle_is_ptr(TypeTableEntry *type_entry) {
 static ZigWindowsSDK *get_windows_sdk(CodeGen *g) {
     if (g->win_sdk == nullptr) {
         if (os_find_windows_sdk(&g->win_sdk)) {
-            zig_panic("Unable to determine Windows SDK path.");
+            fprintf(stderr, "unable to determine windows sdk path\n");
+            exit(1);
         }
     }
     assert(g->win_sdk != nullptr);
     return g->win_sdk;
 }
 
-void find_libc_include_path(CodeGen *g) {
-    if (!g->libc_include_dir || buf_len(g->libc_include_dir) == 0) {
-        ZigWindowsSDK *sdk = get_windows_sdk(g);
 
-        if (g->zig_target.os == OsWindows) {
-            if (os_get_win32_ucrt_include_path(sdk, g->libc_include_dir)) {
-                zig_panic("Unable to determine libc include path.");
-            }
+Buf *get_linux_libc_lib_path(const char *o_file) {
+    const char *cc_exe = getenv("CC");
+    cc_exe = (cc_exe == nullptr) ? "cc" : cc_exe;
+    ZigList<const char *> args = {};
+    args.append(buf_ptr(buf_sprintf("-print-file-name=%s", o_file)));
+    Termination term;
+    Buf *out_stderr = buf_alloc();
+    Buf *out_stdout = buf_alloc();
+    int err;
+    if ((err = os_exec_process(cc_exe, args, &term, out_stderr, out_stdout))) {
+        zig_panic("unable to determine libc lib path: executing C compiler: %s", err_str(err));
+    }
+    if (term.how != TerminationIdClean || term.code != 0) {
+        zig_panic("unable to determine libc lib path: executing C compiler command failed");
+    }
+    if (buf_ends_with_str(out_stdout, "\n")) {
+        buf_resize(out_stdout, buf_len(out_stdout) - 1);
+    }
+    if (buf_len(out_stdout) == 0 || buf_eql_str(out_stdout, o_file)) {
+        zig_panic("unable to determine libc lib path: C compiler could not find %s", o_file);
+    }
+    Buf *result = buf_alloc();
+    os_path_dirname(out_stdout, result);
+    return result;
+}
+
+Buf *get_linux_libc_include_path(void) {
+    const char *cc_exe = getenv("CC");
+    cc_exe = (cc_exe == nullptr) ? "cc" : cc_exe;
+    ZigList<const char *> args = {};
+    args.append("-E");
+    args.append("-Wp,-v");
+    args.append("-xc");
+    args.append("/dev/null");
+    Termination term;
+    Buf *out_stderr = buf_alloc();
+    Buf *out_stdout = buf_alloc();
+    int err;
+    if ((err = os_exec_process(cc_exe, args, &term, out_stderr, out_stdout))) {
+        zig_panic("unable to determine libc include path: executing C compiler: %s", err_str(err));
+    }
+    if (term.how != TerminationIdClean || term.code != 0) {
+        zig_panic("unable to determine libc include path: executing C compiler command failed");
+    }
+    char *prev_newline = buf_ptr(out_stderr);
+    ZigList<const char *> search_paths = {};
+    for (;;) {
+        char *newline = strchr(prev_newline, '\n');
+        if (newline == nullptr) {
+            break;
+        }
+        *newline = 0;
+        if (prev_newline[0] == ' ') {
+            search_paths.append(prev_newline);
+        }
+        prev_newline = newline + 1;
+    }
+    if (search_paths.length == 0) {
+        zig_panic("unable to determine libc include path: even C compiler does not know where libc headers are");
+    }
+    for (size_t i = 0; i < search_paths.length; i += 1) {
+        // search in reverse order
+        const char *search_path = search_paths.items[search_paths.length - i - 1];
+        // cut off spaces
+        while (*search_path == ' ') {
+            search_path += 1;
+        }
+        Buf *stdlib_path = buf_sprintf("%s/stdlib.h", search_path);
+        bool exists;
+        if ((err = os_file_exists(stdlib_path, &exists))) {
+            exists = false;
+        }
+        if (exists) {
+            return buf_create_from_str(search_path);
         }
     }
+    zig_panic("unable to determine libc include path: stdlib.h not found in C compiler search paths");
+}
 
-    // TODO find libc at runtime for other operating systems
-    if(!g->libc_include_dir || buf_len(g->libc_include_dir) == 0) {
-        zig_panic("Unable to determine libc include path.");
+void find_libc_include_path(CodeGen *g) {
+    if (g->libc_include_dir == nullptr) {
+
+        if (g->zig_target.os == OsWindows) {
+            ZigWindowsSDK *sdk = get_windows_sdk(g);
+            g->libc_include_dir = buf_alloc();
+            if (os_get_win32_ucrt_include_path(sdk, g->libc_include_dir)) {
+                fprintf(stderr, "Unable to determine libc include path. --libc-include-dir");
+                exit(1);
+            }
+        } else if (g->zig_target.os == OsLinux) {
+            g->libc_include_dir = get_linux_libc_include_path();
+        } else if (g->zig_target.os == OsMacOSX) {
+            g->libc_include_dir = buf_create_from_str("/usr/include");
+        } else {
+            // TODO find libc at runtime for other operating systems
+            zig_panic("Unable to determine libc include path.");
+        }
     }
+    assert(buf_len(g->libc_include_dir) != 0);
 }
 
 void find_libc_lib_path(CodeGen *g) {
     // later we can handle this better by reporting an error via the normal mechanism
-    if (!g->libc_lib_dir || buf_len(g->libc_lib_dir) == 0 ||
+    if (g->libc_lib_dir == nullptr ||
         (g->zig_target.os == OsWindows && (g->msvc_lib_dir == nullptr || g->kernel32_lib_dir == nullptr)))
     {
         if (g->zig_target.os == OsWindows) {
             ZigWindowsSDK *sdk = get_windows_sdk(g);
 
-            Buf* vc_lib_dir = buf_alloc();
-            if (os_get_win32_vcruntime_path(vc_lib_dir, g->zig_target.arch.arch)) {
-                zig_panic("Unable to determine vcruntime path.");
+            if (g->msvc_lib_dir == nullptr) {
+                Buf* vc_lib_dir = buf_alloc();
+                if (os_get_win32_vcruntime_path(vc_lib_dir, g->zig_target.arch.arch)) {
+                    fprintf(stderr, "Unable to determine vcruntime path. --msvc-lib-dir");
+                    exit(1);
+                }
+                g->msvc_lib_dir = vc_lib_dir;
             }
 
-            Buf* ucrt_lib_path = buf_alloc();
-            if (os_get_win32_ucrt_lib_path(sdk, ucrt_lib_path, g->zig_target.arch.arch)) {
-                zig_panic("Unable to determine ucrt path.");
+            if (g->libc_lib_dir == nullptr) {
+                Buf* ucrt_lib_path = buf_alloc();
+                if (os_get_win32_ucrt_lib_path(sdk, ucrt_lib_path, g->zig_target.arch.arch)) {
+                    fprintf(stderr, "Unable to determine ucrt path. --libc-lib-dir");
+                    exit(1);
+                }
+                g->libc_lib_dir = ucrt_lib_path;
             }
 
-            Buf* kern_lib_path = buf_alloc();
-            if (os_get_win32_kern32_path(sdk, kern_lib_path, g->zig_target.arch.arch)) {
-                zig_panic("Unable to determine kernel32 path.");
+            if (g->kernel32_lib_dir == nullptr) {
+                Buf* kern_lib_path = buf_alloc();
+                if (os_get_win32_kern32_path(sdk, kern_lib_path, g->zig_target.arch.arch)) {
+                    fprintf(stderr, "Unable to determine kernel32 path. --kernel32-lib-dir");
+                    exit(1);
+                }
+                g->kernel32_lib_dir = kern_lib_path;
             }
 
-            g->msvc_lib_dir = vc_lib_dir;
-            g->libc_lib_dir = ucrt_lib_path;
-            g->kernel32_lib_dir = kern_lib_path;
+        } else if (g->zig_target.os == OsLinux) {
+            g->libc_lib_dir = get_linux_libc_lib_path("crt1.o");
         } else {
             zig_panic("Unable to determine libc lib path.");
         }
+    } else {
+        assert(buf_len(g->libc_lib_dir) != 0);
     }
 
-    if (!g->libc_static_lib_dir || buf_len(g->libc_static_lib_dir) == 0) {
+    if (g->libc_static_lib_dir == nullptr) {
         if ((g->zig_target.os == OsWindows) && (g->msvc_lib_dir != NULL)) {
             return;
-        }
-        else {
+        } else if (g->zig_target.os == OsLinux) {
+            g->libc_static_lib_dir = get_linux_libc_lib_path("crtbegin.o");
+        } else {
             zig_panic("Unable to determine libc static lib path.");
         }
+    } else {
+        assert(buf_len(g->libc_static_lib_dir) != 0);
     }
 }
 
@@ -4395,6 +4620,52 @@ bool fn_type_id_eql(FnTypeId *a, FnTypeId *b) {
     return true;
 }
 
+static uint32_t hash_const_val_ptr(ConstExprValue *const_val) {
+    uint32_t hash_val = 0;
+    switch (const_val->data.x_ptr.mut) {
+        case ConstPtrMutRuntimeVar:
+            hash_val += (uint32_t)3500721036;
+            break;
+        case ConstPtrMutComptimeConst:
+            hash_val += (uint32_t)4214318515;
+            break;
+        case ConstPtrMutComptimeVar:
+            hash_val += (uint32_t)1103195694;
+            break;
+    }
+    switch (const_val->data.x_ptr.special) {
+        case ConstPtrSpecialInvalid:
+            zig_unreachable();
+        case ConstPtrSpecialRef:
+            hash_val += (uint32_t)2478261866;
+            hash_val += hash_ptr(const_val->data.x_ptr.data.ref.pointee);
+            return hash_val;
+        case ConstPtrSpecialBaseArray:
+            hash_val += (uint32_t)1764906839;
+            hash_val += hash_ptr(const_val->data.x_ptr.data.base_array.array_val);
+            hash_val += hash_size(const_val->data.x_ptr.data.base_array.elem_index);
+            hash_val += const_val->data.x_ptr.data.base_array.is_cstr ? 1297263887 : 200363492;
+            return hash_val;
+        case ConstPtrSpecialBaseStruct:
+            hash_val += (uint32_t)3518317043;
+            hash_val += hash_ptr(const_val->data.x_ptr.data.base_struct.struct_val);
+            hash_val += hash_size(const_val->data.x_ptr.data.base_struct.field_index);
+            return hash_val;
+        case ConstPtrSpecialHardCodedAddr:
+            hash_val += (uint32_t)4048518294;
+            hash_val += hash_size(const_val->data.x_ptr.data.hard_coded_addr.addr);
+            return hash_val;
+        case ConstPtrSpecialDiscard:
+            hash_val += 2010123162;
+            return hash_val;
+        case ConstPtrSpecialFunction:
+            hash_val += (uint32_t)2590901619;
+            hash_val += hash_ptr(const_val->data.x_ptr.data.fn.fn_entry);
+            return hash_val;
+    }
+    zig_unreachable();
+}
+
 static uint32_t hash_const_val(ConstExprValue *const_val) {
     assert(const_val->special == ConstValSpecialStatic);
     switch (const_val->type->id) {
@@ -4407,7 +4678,7 @@ static uint32_t hash_const_val(ConstExprValue *const_val) {
         case TypeTableEntryIdVoid:
             return (uint32_t)4149439618;
         case TypeTableEntryIdInt:
-        case TypeTableEntryIdNumLitInt:
+        case TypeTableEntryIdComptimeInt:
             {
                 uint32_t result = 1331471175;
                 for (size_t i = 0; i < const_val->data.x_bigint.digit_count; i += 1) {
@@ -4427,6 +4698,13 @@ static uint32_t hash_const_val(ConstExprValue *const_val) {
             }
         case TypeTableEntryIdFloat:
             switch (const_val->type->data.floating.bit_count) {
+                case 16:
+                    {
+                        uint16_t result;
+                        static_assert(sizeof(result) == sizeof(const_val->data.x_f16), "");
+                        memcpy(&result, &const_val->data.x_f16, sizeof(result));
+                        return result * 65537u;
+                    }
                 case 32:
                     {
                         uint32_t result;
@@ -4448,7 +4726,7 @@ static uint32_t hash_const_val(ConstExprValue *const_val) {
                 default:
                     zig_unreachable();
             }
-        case TypeTableEntryIdNumLitFloat:
+        case TypeTableEntryIdComptimeFloat:
             {
                 float128_t f128 = bigfloat_to_f128(&const_val->data.x_bigfloat);
                 uint32_t ints[4];
@@ -4458,54 +4736,18 @@ static uint32_t hash_const_val(ConstExprValue *const_val) {
         case TypeTableEntryIdArgTuple:
             return (uint32_t)const_val->data.x_arg_tuple.start_index * (uint32_t)281907309 +
                 (uint32_t)const_val->data.x_arg_tuple.end_index * (uint32_t)2290442768;
+        case TypeTableEntryIdFn:
+            assert(const_val->data.x_ptr.mut == ConstPtrMutComptimeConst);
+            assert(const_val->data.x_ptr.special == ConstPtrSpecialFunction);
+            return 3677364617 ^ hash_ptr(const_val->data.x_ptr.data.fn.fn_entry);
         case TypeTableEntryIdPointer:
-            {
-                uint32_t hash_val = 0;
-                switch (const_val->data.x_ptr.mut) {
-                    case ConstPtrMutRuntimeVar:
-                        hash_val += (uint32_t)3500721036;
-                        break;
-                    case ConstPtrMutComptimeConst:
-                        hash_val += (uint32_t)4214318515;
-                        break;
-                    case ConstPtrMutComptimeVar:
-                        hash_val += (uint32_t)1103195694;
-                        break;
-                }
-                switch (const_val->data.x_ptr.special) {
-                    case ConstPtrSpecialInvalid:
-                        zig_unreachable();
-                    case ConstPtrSpecialRef:
-                        hash_val += (uint32_t)2478261866;
-                        hash_val += hash_ptr(const_val->data.x_ptr.data.ref.pointee);
-                        return hash_val;
-                    case ConstPtrSpecialBaseArray:
-                        hash_val += (uint32_t)1764906839;
-                        hash_val += hash_ptr(const_val->data.x_ptr.data.base_array.array_val);
-                        hash_val += hash_size(const_val->data.x_ptr.data.base_array.elem_index);
-                        hash_val += const_val->data.x_ptr.data.base_array.is_cstr ? 1297263887 : 200363492;
-                        return hash_val;
-                    case ConstPtrSpecialBaseStruct:
-                        hash_val += (uint32_t)3518317043;
-                        hash_val += hash_ptr(const_val->data.x_ptr.data.base_struct.struct_val);
-                        hash_val += hash_size(const_val->data.x_ptr.data.base_struct.field_index);
-                        return hash_val;
-                    case ConstPtrSpecialHardCodedAddr:
-                        hash_val += (uint32_t)4048518294;
-                        hash_val += hash_size(const_val->data.x_ptr.data.hard_coded_addr.addr);
-                        return hash_val;
-                    case ConstPtrSpecialDiscard:
-                        hash_val += 2010123162;
-                        return hash_val;
-                }
-                zig_unreachable();
-            }
+            return hash_const_val_ptr(const_val);
         case TypeTableEntryIdPromise:
             // TODO better hashing algorithm
             return 223048345;
-        case TypeTableEntryIdUndefLit:
+        case TypeTableEntryIdUndefined:
             return 162837799;
-        case TypeTableEntryIdNullLit:
+        case TypeTableEntryIdNull:
             return 844854567;
         case TypeTableEntryIdArray:
             // TODO better hashing algorithm
@@ -4516,11 +4758,15 @@ static uint32_t hash_const_val(ConstExprValue *const_val) {
         case TypeTableEntryIdUnion:
             // TODO better hashing algorithm
             return 2709806591;
-        case TypeTableEntryIdMaybe:
-            if (const_val->data.x_maybe) {
-                return hash_const_val(const_val->data.x_maybe) * 1992916303;
+        case TypeTableEntryIdOptional:
+            if (get_codegen_ptr_type(const_val->type) != nullptr) {
+                return hash_const_val(const_val) * 1992916303;
             } else {
-                return 4016830364;
+                if (const_val->data.x_optional) {
+                    return hash_const_val(const_val->data.x_optional) * 1992916303;
+                } else {
+                    return 4016830364;
+                }
             }
         case TypeTableEntryIdErrorUnion:
             // TODO better hashing algorithm
@@ -4528,8 +4774,6 @@ static uint32_t hash_const_val(ConstExprValue *const_val) {
         case TypeTableEntryIdErrorSet:
             assert(const_val->data.x_err_set != nullptr);
             return const_val->data.x_err_set->value ^ 2630160122;
-        case TypeTableEntryIdFn:
-            return 4133894920 ^ hash_ptr(const_val->data.x_fn.fn_entry);
         case TypeTableEntryIdNamespace:
             return hash_ptr(const_val->data.x_import);
         case TypeTableEntryIdBlock:
@@ -4576,11 +4820,123 @@ bool generic_fn_type_id_eql(GenericFnTypeId *a, GenericFnTypeId *b) {
     return true;
 }
 
-bool fn_eval_cacheable(Scope *scope) {
+static bool can_mutate_comptime_var_state(ConstExprValue *value) {
+    assert(value != nullptr);
+    switch (value->type->id) {
+        case TypeTableEntryIdInvalid:
+            zig_unreachable();
+        case TypeTableEntryIdMetaType:
+        case TypeTableEntryIdVoid:
+        case TypeTableEntryIdBool:
+        case TypeTableEntryIdUnreachable:
+        case TypeTableEntryIdInt:
+        case TypeTableEntryIdFloat:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
+        case TypeTableEntryIdNamespace:
+        case TypeTableEntryIdBoundFn:
+        case TypeTableEntryIdFn:
+        case TypeTableEntryIdBlock:
+        case TypeTableEntryIdOpaque:
+        case TypeTableEntryIdPromise:
+        case TypeTableEntryIdErrorSet:
+        case TypeTableEntryIdEnum:
+            return false;
+
+        case TypeTableEntryIdPointer:
+            return value->data.x_ptr.mut == ConstPtrMutComptimeVar;
+
+        case TypeTableEntryIdArray:
+            if (value->type->data.array.len == 0)
+                return false;
+            if (value->data.x_array.special == ConstArraySpecialUndef)
+                return false;
+            for (uint32_t i = 0; i < value->type->data.array.len; i += 1) {
+                if (can_mutate_comptime_var_state(&value->data.x_array.s_none.elements[i]))
+                    return true;
+            }
+            return false;
+
+        case TypeTableEntryIdStruct:
+            for (uint32_t i = 0; i < value->type->data.structure.src_field_count; i += 1) {
+                if (can_mutate_comptime_var_state(&value->data.x_struct.fields[i]))
+                    return true;
+            }
+            return false;
+
+        case TypeTableEntryIdOptional:
+            if (get_codegen_ptr_type(value->type) != nullptr)
+                return value->data.x_ptr.mut == ConstPtrMutComptimeVar;
+            if (value->data.x_optional == nullptr)
+                return false;
+            return can_mutate_comptime_var_state(value->data.x_optional);
+
+        case TypeTableEntryIdErrorUnion:
+            if (value->data.x_err_union.err != nullptr)
+                return false;
+            assert(value->data.x_err_union.payload != nullptr);
+            return can_mutate_comptime_var_state(value->data.x_err_union.payload);
+
+        case TypeTableEntryIdUnion:
+            return can_mutate_comptime_var_state(value->data.x_union.payload);
+
+        case TypeTableEntryIdArgTuple:
+            zig_panic("TODO var args at comptime is currently not supported");
+    }
+    zig_unreachable();
+}
+
+static bool return_type_is_cacheable(TypeTableEntry *return_type) {
+    switch (return_type->id) {
+        case TypeTableEntryIdInvalid:
+            zig_unreachable();
+        case TypeTableEntryIdMetaType:
+        case TypeTableEntryIdVoid:
+        case TypeTableEntryIdBool:
+        case TypeTableEntryIdUnreachable:
+        case TypeTableEntryIdInt:
+        case TypeTableEntryIdFloat:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
+        case TypeTableEntryIdNamespace:
+        case TypeTableEntryIdBoundFn:
+        case TypeTableEntryIdFn:
+        case TypeTableEntryIdBlock:
+        case TypeTableEntryIdOpaque:
+        case TypeTableEntryIdPromise:
+        case TypeTableEntryIdErrorSet:
+        case TypeTableEntryIdEnum:
+        case TypeTableEntryIdPointer:
+            return true;
+
+        case TypeTableEntryIdArray:
+        case TypeTableEntryIdStruct:
+        case TypeTableEntryIdUnion:
+            return false;
+
+        case TypeTableEntryIdOptional:
+            return return_type_is_cacheable(return_type->data.maybe.child_type);
+
+        case TypeTableEntryIdErrorUnion:
+            return return_type_is_cacheable(return_type->data.error_union.payload_type);
+
+        case TypeTableEntryIdArgTuple:
+            zig_panic("TODO var args at comptime is currently not supported");
+    }
+    zig_unreachable();
+}
+
+bool fn_eval_cacheable(Scope *scope, TypeTableEntry *return_type) {
+    if (!return_type_is_cacheable(return_type))
+        return false;
     while (scope) {
         if (scope->id == ScopeIdVarDecl) {
             ScopeVarDecl *var_scope = (ScopeVarDecl *)scope;
-            if (var_scope->var->value->type->can_mutate_state_through_it)
+            if (can_mutate_comptime_var_state(var_scope->var->value))
                 return false;
         } else if (scope->id == ScopeIdFnDef) {
             return true;
@@ -4653,10 +5009,10 @@ bool type_requires_comptime(TypeTableEntry *type_entry) {
         case TypeTableEntryIdInvalid:
         case TypeTableEntryIdOpaque:
             zig_unreachable();
-        case TypeTableEntryIdNumLitFloat:
-        case TypeTableEntryIdNumLitInt:
-        case TypeTableEntryIdUndefLit:
-        case TypeTableEntryIdNullLit:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
         case TypeTableEntryIdMetaType:
         case TypeTableEntryIdNamespace:
         case TypeTableEntryIdBlock:
@@ -4664,17 +5020,29 @@ bool type_requires_comptime(TypeTableEntry *type_entry) {
         case TypeTableEntryIdArgTuple:
             return true;
         case TypeTableEntryIdArray:
+            return type_requires_comptime(type_entry->data.array.child_type);
         case TypeTableEntryIdStruct:
+            assert(type_has_zero_bits_known(type_entry));
+            return type_entry->data.structure.requires_comptime;
         case TypeTableEntryIdUnion:
-        case TypeTableEntryIdMaybe:
+            assert(type_has_zero_bits_known(type_entry));
+            return type_entry->data.unionation.requires_comptime;
+        case TypeTableEntryIdOptional:
+            return type_requires_comptime(type_entry->data.maybe.child_type);
         case TypeTableEntryIdErrorUnion:
+            return type_requires_comptime(type_entry->data.error_union.payload_type);
+        case TypeTableEntryIdPointer:
+            if (type_entry->data.pointer.child_type->id == TypeTableEntryIdOpaque) {
+                return false;
+            } else {
+                return type_requires_comptime(type_entry->data.pointer.child_type);
+            }
         case TypeTableEntryIdEnum:
         case TypeTableEntryIdErrorSet:
         case TypeTableEntryIdFn:
         case TypeTableEntryIdBool:
         case TypeTableEntryIdInt:
         case TypeTableEntryIdFloat:
-        case TypeTableEntryIdPointer:
         case TypeTableEntryIdVoid:
         case TypeTableEntryIdUnreachable:
         case TypeTableEntryIdPromise:
@@ -4730,7 +5098,9 @@ void init_const_c_str_lit(CodeGen *g, ConstExprValue *const_val, Buf *str) {
 
     // then make the pointer point to it
     const_val->special = ConstValSpecialStatic;
-    const_val->type = get_pointer_to_type(g, g->builtin_types.entry_u8, true);
+    // TODO make this `[*]null u8` instead of `[*]u8`
+    const_val->type = get_pointer_to_type_extra(g, g->builtin_types.entry_u8, true, false,
+            PtrLenUnknown, get_abi_alignment(g, g->builtin_types.entry_u8), 0, 0);
     const_val->data.x_ptr.special = ConstPtrSpecialBaseArray;
     const_val->data.x_ptr.data.base_array.array_val = array_val;
     const_val->data.x_ptr.data.base_array.elem_index = 0;
@@ -4791,10 +5161,13 @@ ConstExprValue *create_const_signed(TypeTableEntry *type, int64_t x) {
 void init_const_float(ConstExprValue *const_val, TypeTableEntry *type, double value) {
     const_val->special = ConstValSpecialStatic;
     const_val->type = type;
-    if (type->id == TypeTableEntryIdNumLitFloat) {
+    if (type->id == TypeTableEntryIdComptimeFloat) {
         bigfloat_init_64(&const_val->data.x_bigfloat, value);
     } else if (type->id == TypeTableEntryIdFloat) {
         switch (type->data.floating.bit_count) {
+            case 16:
+                const_val->data.x_f16 = zig_double_to_f16(value);
+                break;
             case 32:
                 const_val->data.x_f32 = value;
                 break;
@@ -4871,13 +5244,16 @@ void init_const_slice(CodeGen *g, ConstExprValue *const_val, ConstExprValue *arr
 {
     assert(array_val->type->id == TypeTableEntryIdArray);
 
-    TypeTableEntry *ptr_type = get_pointer_to_type(g, array_val->type->data.array.child_type, is_const);
+    TypeTableEntry *ptr_type = get_pointer_to_type_extra(g, array_val->type->data.array.child_type,
+            is_const, false, PtrLenUnknown, get_abi_alignment(g, array_val->type->data.array.child_type),
+            0, 0);
 
     const_val->special = ConstValSpecialStatic;
     const_val->type = get_slice_type(g, ptr_type);
     const_val->data.x_struct.fields = create_const_vals(2);
 
-    init_const_ptr_array(g, &const_val->data.x_struct.fields[slice_ptr_index], array_val, start, is_const);
+    init_const_ptr_array(g, &const_val->data.x_struct.fields[slice_ptr_index], array_val, start, is_const,
+            PtrLenUnknown);
     init_const_usize(g, &const_val->data.x_struct.fields[slice_len_index], len);
 }
 
@@ -4888,21 +5264,24 @@ ConstExprValue *create_const_slice(CodeGen *g, ConstExprValue *array_val, size_t
 }
 
 void init_const_ptr_array(CodeGen *g, ConstExprValue *const_val, ConstExprValue *array_val,
-        size_t elem_index, bool is_const)
+        size_t elem_index, bool is_const, PtrLen ptr_len)
 {
     assert(array_val->type->id == TypeTableEntryIdArray);
     TypeTableEntry *child_type = array_val->type->data.array.child_type;
 
     const_val->special = ConstValSpecialStatic;
-    const_val->type = get_pointer_to_type(g, child_type, is_const);
+    const_val->type = get_pointer_to_type_extra(g, child_type, is_const, false,
+            ptr_len, get_abi_alignment(g, child_type), 0, 0);
     const_val->data.x_ptr.special = ConstPtrSpecialBaseArray;
     const_val->data.x_ptr.data.base_array.array_val = array_val;
     const_val->data.x_ptr.data.base_array.elem_index = elem_index;
 }
 
-ConstExprValue *create_const_ptr_array(CodeGen *g, ConstExprValue *array_val, size_t elem_index, bool is_const) {
+ConstExprValue *create_const_ptr_array(CodeGen *g, ConstExprValue *array_val, size_t elem_index, bool is_const,
+        PtrLen ptr_len)
+{
     ConstExprValue *const_val = create_const_vals(1);
-    init_const_ptr_array(g, const_val, array_val, elem_index, is_const);
+    init_const_ptr_array(g, const_val, array_val, elem_index, is_const, ptr_len);
     return const_val;
 }
 
@@ -5021,6 +5400,52 @@ bool ir_get_var_is_comptime(VariableTableEntry *var) {
     return var->is_comptime->value.data.x_bool;
 }
 
+bool const_values_equal_ptr(ConstExprValue *a, ConstExprValue *b) {
+    if (a->data.x_ptr.special != b->data.x_ptr.special)
+        return false;
+    if (a->data.x_ptr.mut != b->data.x_ptr.mut)
+        return false;
+    switch (a->data.x_ptr.special) {
+        case ConstPtrSpecialInvalid:
+            zig_unreachable();
+        case ConstPtrSpecialRef:
+            if (a->data.x_ptr.data.ref.pointee != b->data.x_ptr.data.ref.pointee)
+                return false;
+            return true;
+        case ConstPtrSpecialBaseArray:
+            if (a->data.x_ptr.data.base_array.array_val != b->data.x_ptr.data.base_array.array_val &&
+                a->data.x_ptr.data.base_array.array_val->global_refs !=
+                b->data.x_ptr.data.base_array.array_val->global_refs)
+            {
+                return false;
+            }
+            if (a->data.x_ptr.data.base_array.elem_index != b->data.x_ptr.data.base_array.elem_index)
+                return false;
+            if (a->data.x_ptr.data.base_array.is_cstr != b->data.x_ptr.data.base_array.is_cstr)
+                return false;
+            return true;
+        case ConstPtrSpecialBaseStruct:
+            if (a->data.x_ptr.data.base_struct.struct_val != b->data.x_ptr.data.base_struct.struct_val &&
+                a->data.x_ptr.data.base_struct.struct_val->global_refs !=
+                b->data.x_ptr.data.base_struct.struct_val->global_refs)
+            {
+                return false;
+            }
+            if (a->data.x_ptr.data.base_struct.field_index != b->data.x_ptr.data.base_struct.field_index)
+                return false;
+            return true;
+        case ConstPtrSpecialHardCodedAddr:
+            if (a->data.x_ptr.data.hard_coded_addr.addr != b->data.x_ptr.data.hard_coded_addr.addr)
+                return false;
+            return true;
+        case ConstPtrSpecialDiscard:
+            return true;
+        case ConstPtrSpecialFunction:
+            return a->data.x_ptr.data.fn.fn_entry == b->data.x_ptr.data.fn.fn_entry;
+    }
+    zig_unreachable();
+}
+
 bool const_values_equal(ConstExprValue *a, ConstExprValue *b) {
     assert(a->type->id == b->type->id);
     assert(a->special == ConstValSpecialStatic);
@@ -5051,13 +5476,13 @@ bool const_values_equal(ConstExprValue *a, ConstExprValue *b) {
             return true;
         case TypeTableEntryIdErrorSet:
             return a->data.x_err_set->value == b->data.x_err_set->value;
-        case TypeTableEntryIdFn:
-            return a->data.x_fn.fn_entry == b->data.x_fn.fn_entry;
         case TypeTableEntryIdBool:
             return a->data.x_bool == b->data.x_bool;
         case TypeTableEntryIdFloat:
             assert(a->type->data.floating.bit_count == b->type->data.floating.bit_count);
             switch (a->type->data.floating.bit_count) {
+                case 16:
+                    return f16_eq(a->data.x_f16, b->data.x_f16);
                 case 32:
                     return a->data.x_f32 == b->data.x_f32;
                 case 64:
@@ -5067,55 +5492,30 @@ bool const_values_equal(ConstExprValue *a, ConstExprValue *b) {
                 default:
                     zig_unreachable();
             }
-        case TypeTableEntryIdNumLitFloat:
+        case TypeTableEntryIdComptimeFloat:
             return bigfloat_cmp(&a->data.x_bigfloat, &b->data.x_bigfloat) == CmpEQ;
         case TypeTableEntryIdInt:
-        case TypeTableEntryIdNumLitInt:
+        case TypeTableEntryIdComptimeInt:
             return bigint_cmp(&a->data.x_bigint, &b->data.x_bigint) == CmpEQ;
         case TypeTableEntryIdPointer:
-            if (a->data.x_ptr.special != b->data.x_ptr.special)
-                return false;
-            if (a->data.x_ptr.mut != b->data.x_ptr.mut)
-                return false;
-            switch (a->data.x_ptr.special) {
-                case ConstPtrSpecialInvalid:
-                    zig_unreachable();
-                case ConstPtrSpecialRef:
-                    if (a->data.x_ptr.data.ref.pointee != b->data.x_ptr.data.ref.pointee)
-                        return false;
-                    return true;
-                case ConstPtrSpecialBaseArray:
-                    if (a->data.x_ptr.data.base_array.array_val != b->data.x_ptr.data.base_array.array_val &&
-                        a->data.x_ptr.data.base_array.array_val->global_refs !=
-                        b->data.x_ptr.data.base_array.array_val->global_refs)
-                    {
-                        return false;
-                    }
-                    if (a->data.x_ptr.data.base_array.elem_index != b->data.x_ptr.data.base_array.elem_index)
-                        return false;
-                    if (a->data.x_ptr.data.base_array.is_cstr != b->data.x_ptr.data.base_array.is_cstr)
-                        return false;
-                    return true;
-                case ConstPtrSpecialBaseStruct:
-                    if (a->data.x_ptr.data.base_struct.struct_val != b->data.x_ptr.data.base_struct.struct_val &&
-                        a->data.x_ptr.data.base_struct.struct_val->global_refs !=
-                        b->data.x_ptr.data.base_struct.struct_val->global_refs)
-                    {
-                        return false;
-                    }
-                    if (a->data.x_ptr.data.base_struct.field_index != b->data.x_ptr.data.base_struct.field_index)
-                        return false;
-                    return true;
-                case ConstPtrSpecialHardCodedAddr:
-                    if (a->data.x_ptr.data.hard_coded_addr.addr != b->data.x_ptr.data.hard_coded_addr.addr)
-                        return false;
-                    return true;
-                case ConstPtrSpecialDiscard:
-                    return true;
+        case TypeTableEntryIdFn:
+            return const_values_equal_ptr(a, b);
+        case TypeTableEntryIdArray: {
+            assert(a->type->data.array.len == b->type->data.array.len);
+            assert(a->data.x_array.special != ConstArraySpecialUndef);
+            assert(b->data.x_array.special != ConstArraySpecialUndef);
+
+            size_t len = a->type->data.array.len;
+            ConstExprValue *a_elems = a->data.x_array.s_none.elements;
+            ConstExprValue *b_elems = b->data.x_array.s_none.elements;
+
+            for (size_t i = 0; i < len; ++i) {
+                if (!const_values_equal(&a_elems[i], &b_elems[i]))
+                    return false;
             }
-            zig_unreachable();
-        case TypeTableEntryIdArray:
-            zig_panic("TODO");
+
+            return true;
+        }
         case TypeTableEntryIdStruct:
             for (size_t i = 0; i < a->type->data.structure.src_field_count; i += 1) {
                 ConstExprValue *field_a = &a->data.x_struct.fields[i];
@@ -5124,15 +5524,17 @@ bool const_values_equal(ConstExprValue *a, ConstExprValue *b) {
                     return false;
             }
             return true;
-        case TypeTableEntryIdUndefLit:
+        case TypeTableEntryIdUndefined:
             zig_panic("TODO");
-        case TypeTableEntryIdNullLit:
+        case TypeTableEntryIdNull:
             zig_panic("TODO");
-        case TypeTableEntryIdMaybe:
-            if (a->data.x_maybe == nullptr || b->data.x_maybe == nullptr) {
-                return (a->data.x_maybe == nullptr && b->data.x_maybe == nullptr);
+        case TypeTableEntryIdOptional:
+            if (get_codegen_ptr_type(a->type) != nullptr)
+                return const_values_equal_ptr(a, b);
+            if (a->data.x_optional == nullptr || b->data.x_optional == nullptr) {
+                return (a->data.x_optional == nullptr && b->data.x_optional == nullptr);
             } else {
-                return const_values_equal(a->data.x_maybe, b->data.x_maybe);
+                return const_values_equal(a->data.x_optional, b->data.x_optional);
             }
         case TypeTableEntryIdErrorUnion:
             zig_panic("TODO");
@@ -5205,6 +5607,41 @@ void eval_min_max_value(CodeGen *g, TypeTableEntry *type_entry, ConstExprValue *
     }
 }
 
+void render_const_val_ptr(CodeGen *g, Buf *buf, ConstExprValue *const_val, TypeTableEntry *type_entry) {
+    switch (const_val->data.x_ptr.special) {
+        case ConstPtrSpecialInvalid:
+            zig_unreachable();
+        case ConstPtrSpecialRef:
+        case ConstPtrSpecialBaseStruct:
+            buf_appendf(buf, "*");
+            render_const_value(g, buf, const_ptr_pointee(g, const_val));
+            return;
+        case ConstPtrSpecialBaseArray:
+            if (const_val->data.x_ptr.data.base_array.is_cstr) {
+                buf_appendf(buf, "*(c str lit)");
+                return;
+            } else {
+                buf_appendf(buf, "*");
+                render_const_value(g, buf, const_ptr_pointee(g, const_val));
+                return;
+            }
+        case ConstPtrSpecialHardCodedAddr:
+            buf_appendf(buf, "(%s)(%" ZIG_PRI_x64 ")", buf_ptr(&type_entry->name),
+                    const_val->data.x_ptr.data.hard_coded_addr.addr);
+            return;
+        case ConstPtrSpecialDiscard:
+            buf_append_str(buf, "*_");
+            return;
+        case ConstPtrSpecialFunction:
+            {
+                FnTableEntry *fn_entry = const_val->data.x_ptr.data.fn.fn_entry;
+                buf_appendf(buf, "@ptrCast(%s, %s)", buf_ptr(&const_val->type->name), buf_ptr(&fn_entry->symbol_name));
+                return;
+            }
+    }
+    zig_unreachable();
+}
+
 void render_const_value(CodeGen *g, Buf *buf, ConstExprValue *const_val) {
     switch (const_val->special) {
         case ConstValSpecialRuntime:
@@ -5228,11 +5665,14 @@ void render_const_value(CodeGen *g, Buf *buf, ConstExprValue *const_val) {
         case TypeTableEntryIdVoid:
             buf_appendf(buf, "{}");
             return;
-        case TypeTableEntryIdNumLitFloat:
+        case TypeTableEntryIdComptimeFloat:
             bigfloat_append_buf(buf, &const_val->data.x_bigfloat);
             return;
         case TypeTableEntryIdFloat:
             switch (type_entry->data.floating.bit_count) {
+                case 16:
+                    buf_appendf(buf, "%f", zig_f16_to_double(const_val->data.x_f16));
+                    return;
                 case 32:
                     buf_appendf(buf, "%f", const_val->data.x_f32);
                     return;
@@ -5256,7 +5696,7 @@ void render_const_value(CodeGen *g, Buf *buf, ConstExprValue *const_val) {
                 default:
                     zig_unreachable();
             }
-        case TypeTableEntryIdNumLitInt:
+        case TypeTableEntryIdComptimeInt:
         case TypeTableEntryIdInt:
             bigint_append_buf(buf, &const_val->data.x_bigint, 10);
             return;
@@ -5272,39 +5712,16 @@ void render_const_value(CodeGen *g, Buf *buf, ConstExprValue *const_val) {
                 buf_appendf(buf, "%s", value);
                 return;
             }
-        case TypeTableEntryIdPointer:
-            switch (const_val->data.x_ptr.special) {
-                case ConstPtrSpecialInvalid:
-                    zig_unreachable();
-                case ConstPtrSpecialRef:
-                case ConstPtrSpecialBaseStruct:
-                    buf_appendf(buf, "&");
-                    render_const_value(g, buf, const_ptr_pointee(g, const_val));
-                    return;
-                case ConstPtrSpecialBaseArray:
-                    if (const_val->data.x_ptr.data.base_array.is_cstr) {
-                        buf_appendf(buf, "&(c str lit)");
-                        return;
-                    } else {
-                        buf_appendf(buf, "&");
-                        render_const_value(g, buf, const_ptr_pointee(g, const_val));
-                        return;
-                    }
-                case ConstPtrSpecialHardCodedAddr:
-                    buf_appendf(buf, "(&%s)(%" ZIG_PRI_x64 ")", buf_ptr(&type_entry->data.pointer.child_type->name),
-                            const_val->data.x_ptr.data.hard_coded_addr.addr);
-                    return;
-                case ConstPtrSpecialDiscard:
-                    buf_append_str(buf, "&_");
-                    return;
-            }
-            zig_unreachable();
         case TypeTableEntryIdFn:
             {
-                FnTableEntry *fn_entry = const_val->data.x_fn.fn_entry;
+                assert(const_val->data.x_ptr.mut == ConstPtrMutComptimeConst);
+                assert(const_val->data.x_ptr.special == ConstPtrSpecialFunction);
+                FnTableEntry *fn_entry = const_val->data.x_ptr.data.fn.fn_entry;
                 buf_appendf(buf, "%s", buf_ptr(&fn_entry->symbol_name));
                 return;
             }
+        case TypeTableEntryIdPointer:
+            return render_const_val_ptr(g, buf, const_val, type_entry);
         case TypeTableEntryIdBlock:
             {
                 AstNode *node = const_val->data.x_block->source_node;
@@ -5352,20 +5769,22 @@ void render_const_value(CodeGen *g, Buf *buf, ConstExprValue *const_val) {
                 buf_appendf(buf, "}");
                 return;
             }
-        case TypeTableEntryIdNullLit:
+        case TypeTableEntryIdNull:
             {
                 buf_appendf(buf, "null");
                 return;
             }
-        case TypeTableEntryIdUndefLit:
+        case TypeTableEntryIdUndefined:
             {
                 buf_appendf(buf, "undefined");
                 return;
             }
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdOptional:
             {
-                if (const_val->data.x_maybe) {
-                    render_const_value(g, buf, const_val->data.x_maybe);
+                if (get_codegen_ptr_type(const_val->type) != nullptr)
+                    return render_const_val_ptr(g, buf, const_val, type_entry->data.maybe.child_type);
+                if (const_val->data.x_optional) {
+                    render_const_value(g, buf, const_val->data.x_optional);
                 } else {
                     buf_appendf(buf, "null");
                 }
@@ -5467,11 +5886,11 @@ uint32_t type_id_hash(TypeId x) {
         case TypeTableEntryIdUnreachable:
         case TypeTableEntryIdFloat:
         case TypeTableEntryIdStruct:
-        case TypeTableEntryIdNumLitFloat:
-        case TypeTableEntryIdNumLitInt:
-        case TypeTableEntryIdUndefLit:
-        case TypeTableEntryIdNullLit:
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
+        case TypeTableEntryIdOptional:
         case TypeTableEntryIdErrorSet:
         case TypeTableEntryIdEnum:
         case TypeTableEntryIdUnion:
@@ -5486,6 +5905,7 @@ uint32_t type_id_hash(TypeId x) {
             return hash_ptr(x.data.error_union.err_set_type) ^ hash_ptr(x.data.error_union.payload_type);
         case TypeTableEntryIdPointer:
             return hash_ptr(x.data.pointer.child_type) +
+                ((x.data.pointer.ptr_len == PtrLenSingle) ? (uint32_t)1120226602 : (uint32_t)3200913342) +
                 (x.data.pointer.is_const ? (uint32_t)2749109194 : (uint32_t)4047371087) +
                 (x.data.pointer.is_volatile ? (uint32_t)536730450 : (uint32_t)1685612214) +
                 (((uint32_t)x.data.pointer.alignment) ^ (uint32_t)0x777fbe0e) +
@@ -5512,11 +5932,11 @@ bool type_id_eql(TypeId a, TypeId b) {
         case TypeTableEntryIdUnreachable:
         case TypeTableEntryIdFloat:
         case TypeTableEntryIdStruct:
-        case TypeTableEntryIdNumLitFloat:
-        case TypeTableEntryIdNumLitInt:
-        case TypeTableEntryIdUndefLit:
-        case TypeTableEntryIdNullLit:
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdComptimeFloat:
+        case TypeTableEntryIdComptimeInt:
+        case TypeTableEntryIdUndefined:
+        case TypeTableEntryIdNull:
+        case TypeTableEntryIdOptional:
         case TypeTableEntryIdPromise:
         case TypeTableEntryIdErrorSet:
         case TypeTableEntryIdEnum:
@@ -5534,6 +5954,7 @@ bool type_id_eql(TypeId a, TypeId b) {
 
         case TypeTableEntryIdPointer:
             return a.data.pointer.child_type == b.data.pointer.child_type &&
+                a.data.pointer.ptr_len == b.data.pointer.ptr_len &&
                 a.data.pointer.is_const == b.data.pointer.is_const &&
                 a.data.pointer.is_volatile == b.data.pointer.is_volatile &&
                 a.data.pointer.alignment == b.data.pointer.alignment &&
@@ -5555,10 +5976,14 @@ uint32_t zig_llvm_fn_key_hash(ZigLLVMFnKey x) {
             return (uint32_t)(x.data.ctz.bit_count) * (uint32_t)810453934;
         case ZigLLVMFnIdClz:
             return (uint32_t)(x.data.clz.bit_count) * (uint32_t)2428952817;
+        case ZigLLVMFnIdPopCount:
+            return (uint32_t)(x.data.clz.bit_count) * (uint32_t)101195049;
         case ZigLLVMFnIdFloor:
-            return (uint32_t)(x.data.floor_ceil.bit_count) * (uint32_t)1899859168;
+            return (uint32_t)(x.data.floating.bit_count) * (uint32_t)1899859168;
         case ZigLLVMFnIdCeil:
-            return (uint32_t)(x.data.floor_ceil.bit_count) * (uint32_t)1953839089;
+            return (uint32_t)(x.data.floating.bit_count) * (uint32_t)1953839089;
+        case ZigLLVMFnIdSqrt:
+            return (uint32_t)(x.data.floating.bit_count) * (uint32_t)2225366385;
         case ZigLLVMFnIdOverflowArithmetic:
             return ((uint32_t)(x.data.overflow_arithmetic.bit_count) * 87135777) +
                 ((uint32_t)(x.data.overflow_arithmetic.add_sub_mul) * 31640542) +
@@ -5575,9 +6000,12 @@ bool zig_llvm_fn_key_eql(ZigLLVMFnKey a, ZigLLVMFnKey b) {
             return a.data.ctz.bit_count == b.data.ctz.bit_count;
         case ZigLLVMFnIdClz:
             return a.data.clz.bit_count == b.data.clz.bit_count;
+        case ZigLLVMFnIdPopCount:
+            return a.data.pop_count.bit_count == b.data.pop_count.bit_count;
         case ZigLLVMFnIdFloor:
         case ZigLLVMFnIdCeil:
-            return a.data.floor_ceil.bit_count == b.data.floor_ceil.bit_count;
+        case ZigLLVMFnIdSqrt:
+            return a.data.floating.bit_count == b.data.floating.bit_count;
         case ZigLLVMFnIdOverflowArithmetic:
             return (a.data.overflow_arithmetic.bit_count == b.data.overflow_arithmetic.bit_count) &&
                 (a.data.overflow_arithmetic.add_sub_mul == b.data.overflow_arithmetic.add_sub_mul) &&
@@ -5630,11 +6058,11 @@ static const TypeTableEntryId all_type_ids[] = {
     TypeTableEntryIdPointer,
     TypeTableEntryIdArray,
     TypeTableEntryIdStruct,
-    TypeTableEntryIdNumLitFloat,
-    TypeTableEntryIdNumLitInt,
-    TypeTableEntryIdUndefLit,
-    TypeTableEntryIdNullLit,
-    TypeTableEntryIdMaybe,
+    TypeTableEntryIdComptimeFloat,
+    TypeTableEntryIdComptimeInt,
+    TypeTableEntryIdUndefined,
+    TypeTableEntryIdNull,
+    TypeTableEntryIdOptional,
     TypeTableEntryIdErrorUnion,
     TypeTableEntryIdErrorSet,
     TypeTableEntryIdEnum,
@@ -5657,8 +6085,8 @@ size_t type_id_len() {
     return array_length(all_type_ids);
 }
 
-size_t type_id_index(TypeTableEntryId id) {
-    switch (id) {
+size_t type_id_index(TypeTableEntry *entry) {
+    switch (entry->id) {
         case TypeTableEntryIdInvalid:
             zig_unreachable();
         case TypeTableEntryIdMetaType:
@@ -5678,16 +6106,18 @@ size_t type_id_index(TypeTableEntryId id) {
         case TypeTableEntryIdArray:
             return 7;
         case TypeTableEntryIdStruct:
+            if (entry->data.structure.is_slice)
+                return 6;
             return 8;
-        case TypeTableEntryIdNumLitFloat:
+        case TypeTableEntryIdComptimeFloat:
             return 9;
-        case TypeTableEntryIdNumLitInt:
+        case TypeTableEntryIdComptimeInt:
             return 10;
-        case TypeTableEntryIdUndefLit:
+        case TypeTableEntryIdUndefined:
             return 11;
-        case TypeTableEntryIdNullLit:
+        case TypeTableEntryIdNull:
             return 12;
-        case TypeTableEntryIdMaybe:
+        case TypeTableEntryIdOptional:
             return 13;
         case TypeTableEntryIdErrorUnion:
             return 14;
@@ -5737,16 +6167,16 @@ const char *type_id_name(TypeTableEntryId id) {
             return "Array";
         case TypeTableEntryIdStruct:
             return "Struct";
-        case TypeTableEntryIdNumLitFloat:
-            return "FloatLiteral";
-        case TypeTableEntryIdNumLitInt:
-            return "IntLiteral";
-        case TypeTableEntryIdUndefLit:
-            return "UndefinedLiteral";
-        case TypeTableEntryIdNullLit:
-            return "NullLiteral";
-        case TypeTableEntryIdMaybe:
-            return "Nullable";
+        case TypeTableEntryIdComptimeFloat:
+            return "ComptimeFloat";
+        case TypeTableEntryIdComptimeInt:
+            return "ComptimeInt";
+        case TypeTableEntryIdUndefined:
+            return "Undefined";
+        case TypeTableEntryIdNull:
+            return "Null";
+        case TypeTableEntryIdOptional:
+            return "Optional";
         case TypeTableEntryIdErrorUnion:
             return "ErrorUnion";
         case TypeTableEntryIdErrorSet:
@@ -5863,4 +6293,3 @@ bool type_can_fail(TypeTableEntry *type_entry) {
 bool fn_type_can_fail(FnTypeId *fn_type_id) {
     return type_can_fail(fn_type_id->return_type) || fn_type_id->cc == CallingConventionAsync;
 }
-

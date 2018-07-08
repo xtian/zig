@@ -503,10 +503,27 @@ void get_target_triple(Buf *triple, const ZigTarget *target) {
     get_arch_name(arch_name, &target->arch);
 
     buf_resize(triple, 0);
-    buf_appendf(triple, "%s-%s-%s-%s", arch_name,
-            ZigLLVMGetVendorTypeName(target->vendor),
-            ZigLLVMGetOSTypeName(get_llvm_os_type(target->os)),
-            ZigLLVMGetEnvironmentTypeName(target->env_type));
+
+    // LLVM WebAssembly output support requires the target to be activated at
+    // build type with -DCMAKE_LLVM_EXPIERMENTAL_TARGETS_TO_BUILD=WebAssembly.
+    //
+    // LLVM determines the output format based on the environment suffix,
+    // defaulting to an object based on the architecture. The default format in
+    // LLVM 6 sets the wasm arch output incorrectly to ELF. We need to
+    // explicitly set this ourself in order for it to work.
+    //
+    // This is fixed in LLVM 7 and you will be able to get wasm output by
+    // using the target triple `wasm32-unknown-unknown-unknown`.
+    if (!strncmp(arch_name, "wasm", 4)) {
+        buf_appendf(triple, "%s-%s-%s-wasm", arch_name,
+                ZigLLVMGetVendorTypeName(target->vendor),
+                ZigLLVMGetOSTypeName(get_llvm_os_type(target->os)));
+    } else {
+        buf_appendf(triple, "%s-%s-%s-%s", arch_name,
+                ZigLLVMGetVendorTypeName(target->vendor),
+                ZigLLVMGetOSTypeName(get_llvm_os_type(target->os)),
+                ZigLLVMGetEnvironmentTypeName(target->env_type));
+    }
 }
 
 static bool is_os_darwin(ZigTarget *target) {
@@ -580,10 +597,13 @@ void resolve_target_object_format(ZigTarget *target) {
         case ZigLLVM_tce:
         case ZigLLVM_tcele:
         case ZigLLVM_thumbeb:
-        case ZigLLVM_wasm32:
-        case ZigLLVM_wasm64:
         case ZigLLVM_xcore:
             target->oformat= ZigLLVM_ELF;
+            return;
+
+        case ZigLLVM_wasm32:
+        case ZigLLVM_wasm64:
+            target->oformat = ZigLLVM_Wasm;
             return;
 
         case ZigLLVM_ppc:
@@ -666,26 +686,47 @@ static int get_arch_pointer_bit_width(ZigLLVM_ArchType arch) {
 uint32_t target_c_type_size_in_bits(const ZigTarget *target, CIntType id) {
     switch (target->os) {
         case OsFreestanding:
-            switch (id) {
-                case CIntTypeShort:
-                case CIntTypeUShort:
-                    return 16;
-                case CIntTypeInt:
-                case CIntTypeUInt:
-                    return 32;
-                case CIntTypeLong:
-                case CIntTypeULong:
-                    return get_arch_pointer_bit_width(target->arch.arch);
-                case CIntTypeLongLong:
-                case CIntTypeULongLong:
-                    return 64;
-                case CIntTypeCount:
-                    zig_unreachable();
+            switch (target->arch.arch) {
+                case ZigLLVM_msp430:
+                    switch (id) {
+                        case CIntTypeShort:
+                        case CIntTypeUShort:
+                            return 16;
+                        case CIntTypeInt:
+                        case CIntTypeUInt:
+                            return 16;
+                        case CIntTypeLong:
+                        case CIntTypeULong:
+                            return 32;
+                        case CIntTypeLongLong:
+                        case CIntTypeULongLong:
+                            return 64;
+                        case CIntTypeCount:
+                            zig_unreachable();
+                    }
+                default:
+                    switch (id) {
+                        case CIntTypeShort:
+                        case CIntTypeUShort:
+                            return 16;
+                        case CIntTypeInt:
+                        case CIntTypeUInt:
+                            return 32;
+                        case CIntTypeLong:
+                        case CIntTypeULong:
+                            return get_arch_pointer_bit_width(target->arch.arch);
+                        case CIntTypeLongLong:
+                        case CIntTypeULongLong:
+                            return 64;
+                        case CIntTypeCount:
+                            zig_unreachable();
+                    }
             }
         case OsFreeBSD:
         case OsLinux:
         case OsMacOSX:
         case OsZen:
+        case OsOpenBSD:
             switch (id) {
                 case CIntTypeShort:
                 case CIntTypeUShort:
@@ -725,7 +766,6 @@ uint32_t target_c_type_size_in_bits(const ZigTarget *target, CIntType id) {
         case OsKFreeBSD:
         case OsLv2:
         case OsNetBSD:
-        case OsOpenBSD:
         case OsSolaris:
         case OsHaiku:
         case OsMinix:
@@ -846,6 +886,10 @@ Buf *target_dynamic_linker(ZigTarget *target) {
             env == ZigLLVM_GNUX32)
     {
         return buf_create_from_str("/libx32/ld-linux-x32.so.2");
+    } else if (arch == ZigLLVM_x86_64 &&
+            (env == ZigLLVM_Musl || env == ZigLLVM_MuslEABI || env == ZigLLVM_MuslEABIHF))
+    {
+        return buf_create_from_str("/lib/ld-musl-x86_64.so.1");
     } else {
         return buf_create_from_str("/lib64/ld-linux-x86-64.so.2");
     }
@@ -874,4 +918,66 @@ bool target_can_exec(const ZigTarget *host_target, const ZigTarget *guest_target
     }
 
     return false;
+}
+
+const char *arch_stack_pointer_register_name(const ArchType *arch) {
+    switch (arch->arch) {
+        case ZigLLVM_UnknownArch:
+            zig_unreachable();
+        case ZigLLVM_x86:
+            return "sp";
+        case ZigLLVM_x86_64:
+            return "rsp";
+
+        case ZigLLVM_aarch64:
+        case ZigLLVM_arm:
+        case ZigLLVM_thumb:
+        case ZigLLVM_aarch64_be:
+        case ZigLLVM_amdgcn:
+        case ZigLLVM_amdil:
+        case ZigLLVM_amdil64:
+        case ZigLLVM_armeb:
+        case ZigLLVM_arc:
+        case ZigLLVM_avr:
+        case ZigLLVM_bpfeb:
+        case ZigLLVM_bpfel:
+        case ZigLLVM_hexagon:
+        case ZigLLVM_lanai:
+        case ZigLLVM_hsail:
+        case ZigLLVM_hsail64:
+        case ZigLLVM_kalimba:
+        case ZigLLVM_le32:
+        case ZigLLVM_le64:
+        case ZigLLVM_mips:
+        case ZigLLVM_mips64:
+        case ZigLLVM_mips64el:
+        case ZigLLVM_mipsel:
+        case ZigLLVM_msp430:
+        case ZigLLVM_nios2:
+        case ZigLLVM_nvptx:
+        case ZigLLVM_nvptx64:
+        case ZigLLVM_ppc64le:
+        case ZigLLVM_r600:
+        case ZigLLVM_renderscript32:
+        case ZigLLVM_renderscript64:
+        case ZigLLVM_riscv32:
+        case ZigLLVM_riscv64:
+        case ZigLLVM_shave:
+        case ZigLLVM_sparc:
+        case ZigLLVM_sparcel:
+        case ZigLLVM_sparcv9:
+        case ZigLLVM_spir:
+        case ZigLLVM_spir64:
+        case ZigLLVM_systemz:
+        case ZigLLVM_tce:
+        case ZigLLVM_tcele:
+        case ZigLLVM_thumbeb:
+        case ZigLLVM_wasm32:
+        case ZigLLVM_wasm64:
+        case ZigLLVM_xcore:
+        case ZigLLVM_ppc:
+        case ZigLLVM_ppc64:
+            zig_panic("TODO populate this table with stack pointer register name for this CPU architecture");
+    }
+    zig_unreachable();
 }

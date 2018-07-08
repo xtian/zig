@@ -1,6 +1,6 @@
 const tests = @import("tests.zig");
 
-pub fn addCases(cases: &tests.GenHContext) void {
+pub fn addCases(cases: *tests.GenHContext) void {
     cases.add("declare enum",
         \\const Foo = extern enum { A, B, C };
         \\export fn entry(foo: Foo) void { }
@@ -51,10 +51,20 @@ pub fn addCases(cases: &tests.GenHContext) void {
         \\
     );
 
+    cases.add("declare opaque type",
+        \\export const Foo = @OpaqueType();
+        \\
+        \\export fn entry(foo: ?*Foo) void { }
+    ,
+        \\struct Foo;
+        \\
+        \\TEST_EXPORT void entry(struct Foo * foo);
+    );
+
     cases.add("array field-type",
         \\const Foo = extern struct {
         \\    A: [2]i32,
-        \\    B: [4]&u32,
+        \\    B: [4]*u32,
         \\};
         \\export fn entry(foo: Foo, bar: [3]u8) void { }
     ,

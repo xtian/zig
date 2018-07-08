@@ -5,13 +5,18 @@ if(NOT CMAKE_BUILD_TYPE)
         "Choose the type of build, options are: Debug Release RelWithDebInfo MinSizeRel." FORCE)
 endif()
 
+if(NOT CMAKE_INSTALL_PREFIX)
+  set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}" CACHE STRING
+      "Directory to install zig to" FORCE)
+endif()
+
 project(zig C CXX)
 set(CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake ${CMAKE_MODULE_PATH})
 
 
 set(ZIG_VERSION_MAJOR 0)
-set(ZIG_VERSION_MINOR 1)
-set(ZIG_VERSION_PATCH 1)
+set(ZIG_VERSION_MINOR 2)
+set(ZIG_VERSION_PATCH 0)
 set(ZIG_VERSION "${ZIG_VERSION_MAJOR}.${ZIG_VERSION_MINOR}.${ZIG_VERSION_PATCH}")
 
 if(${CMAKE_SYSTEM_NAME} MATCHES "FreeBSD")
@@ -21,7 +26,7 @@ endif()
 find_program(GIT_EXE NAMES git)
 if(GIT_EXE)
     execute_process(
-        COMMAND ${GIT_EXE} name-rev HEAD --tags --name-only --no-undefined --always
+        COMMAND ${GIT_EXE} -C ${CMAKE_SOURCE_DIR} name-rev HEAD --tags --name-only --no-undefined --always
         OUTPUT_VARIABLE ZIG_GIT_REV
         OUTPUT_STRIP_TRAILING_WHITESPACE)
     if(ZIG_GIT_REV MATCHES "\\^0$")
@@ -29,16 +34,12 @@ if(GIT_EXE)
             message("WARNING: Tag does not match configured Zig version")
         endif()
     else()
-        set(ZIG_VERSION "${ZIG_VERSION_MAJOR}.${ZIG_VERSION_MINOR}.${ZIG_VERSION_PATCH}.${ZIG_GIT_REV}")
+        set(ZIG_VERSION "${ZIG_VERSION}+${ZIG_GIT_REV}")
     endif()
 endif()
 message("Configuring zig version ${ZIG_VERSION}")
 
-set(ZIG_LIBC_LIB_DIR "" CACHE STRING "Default native target libc directory where crt1.o can be found")
-set(ZIG_LIBC_STATIC_LIB_DIR "" CACHE STRING "Default native target libc directory where crtbeginT.o can be found")
-set(ZIG_LIBC_INCLUDE_DIR "/usr/include" CACHE STRING "Default native target libc include directory")
-set(ZIG_DYNAMIC_LINKER "" CACHE STRING "Override dynamic linker for native target")
-set(ZIG_EACH_LIB_RPATH off CACHE BOOL "Add each dynamic library to rpath for native target")
+set(ZIG_STATIC off CACHE BOOL "Attempt to build a static zig executable (not compatible with glibc)")
 
 string(REGEX REPLACE "\\\\" "\\\\\\\\" ZIG_LIBC_LIB_DIR_ESCAPED "${ZIG_LIBC_LIB_DIR}")
 string(REGEX REPLACE "\\\\" "\\\\\\\\" ZIG_LIBC_STATIC_LIB_DIR_ESCAPED "${ZIG_LIBC_STATIC_LIB_DIR}")
@@ -52,6 +53,22 @@ option(ZIG_FORCE_EXTERNAL_LLD "If your system has the LLD patches use it instead
 
 find_package(llvm)
 find_package(clang)
+
+if(NOT MSVC)
+    find_library(LIBXML2 NAMES xml2 libxml2)
+    if(${LIBXML2} STREQUAL "LIBXML2-NOTFOUND")
+        message(FATAL_ERROR "Could not find libxml2")
+    else()
+        message("${LIBXML2} found")
+    endif()
+
+    find_library(ZLIB NAMES z zlib libz)
+    if(${ZLIB} STREQUAL "ZLIB-NOTFOUND")
+        message(FATAL_ERROR "Could not find zlib")
+    else()
+        message("${ZLIB} found")
+    endif()
+endif()
 
 set(ZIG_CPP_LIB_DIR "${CMAKE_BINARY_DIR}/zig_cpp")
 
@@ -183,7 +200,7 @@ else()
     if(MSVC)
         set(ZIG_LLD_COMPILE_FLAGS "-std=c++11 -D_CRT_SECURE_NO_WARNINGS /w")
     else()
-        set(ZIG_LLD_COMPILE_FLAGS "-std=c++11 -fno-exceptions -fno-rtti -Wno-comment")
+      set(ZIG_LLD_COMPILE_FLAGS "-std=c++11 -fno-exceptions -fno-rtti -Wno-comment -Wno-class-memaccess -Wno-unknown-warning-option")
     endif()
     set_target_properties(embedded_lld_lib PROPERTIES
         COMPILE_FLAGS ${ZIG_LLD_COMPILE_FLAGS}
@@ -248,12 +265,15 @@ endif()
 set(EMBEDDED_SOFTFLOAT_SOURCES
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/8086/f128M_isSignalingNaN.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/8086/s_commonNaNToF128M.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/8086/s_commonNaNToF16UI.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/8086/s_commonNaNToF32UI.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/8086/s_commonNaNToF64UI.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/8086/s_f128MToCommonNaN.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/8086/s_f16UIToCommonNaN.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/8086/s_f32UIToCommonNaN.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/8086/s_f64UIToCommonNaN.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/8086/s_propagateNaNF128M.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/8086/s_propagateNaNF16UI.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/8086/softfloat_raiseFlags.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f128M_add.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f128M_div.c"
@@ -280,8 +300,20 @@ set(EMBEDDED_SOFTFLOAT_SOURCES
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f128M_to_ui32_r_minMag.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f128M_to_ui64.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f128M_to_ui64_r_minMag.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f16_add.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f16_div.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f16_eq.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f16_lt.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f16_mul.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f16_rem.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f16_roundToInt.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f16_sqrt.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f16_sub.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f16_to_f128M.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f16_to_f64.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f32_to_f128M.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f64_to_f128M.c"
+    "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/f64_to_f16.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/s_add256M.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/s_addCarryM.c"
     "${CMAKE_SOURCE_DIR}/deps/SoftFloat-3e/source/s_addComplCarryM.c"
@@ -402,6 +434,10 @@ set(ZIG_CPP_SOURCES
 
 set(ZIG_STD_FILES
     "array_list.zig"
+    "atomic/index.zig"
+    "atomic/queue_mpmc.zig"
+    "atomic/queue_mpsc.zig"
+    "atomic/stack.zig"
     "base64.zig"
     "buf_map.zig"
     "buf_set.zig"
@@ -411,27 +447,35 @@ set(ZIG_STD_FILES
     "c/index.zig"
     "c/linux.zig"
     "c/windows.zig"
+    "crypto/blake2.zig"
+    "crypto/hmac.zig"
     "crypto/index.zig"
     "crypto/md5.zig"
     "crypto/sha1.zig"
     "crypto/sha2.zig"
     "crypto/sha3.zig"
-    "crypto/blake2.zig"
     "cstr.zig"
     "debug/failing_allocator.zig"
     "debug/index.zig"
     "dwarf.zig"
+    "dynamic_library.zig"
     "elf.zig"
     "empty.zig"
-    "endian.zig"
+    "event.zig"
     "fmt/errol/enum3.zig"
     "fmt/errol/index.zig"
     "fmt/errol/lookup.zig"
     "fmt/index.zig"
+    "hash/adler.zig"
+    "hash/crc.zig"
+    "hash/fnv.zig"
+    "hash/index.zig"
+    "hash/siphash.zig"
     "hash_map.zig"
     "heap.zig"
     "index.zig"
     "io.zig"
+    "json.zig"
     "linked_list.zig"
     "macho.zig"
     "math/acos.zig"
@@ -441,8 +485,31 @@ set(ZIG_STD_FILES
     "math/atan.zig"
     "math/atan2.zig"
     "math/atanh.zig"
+    "math/big/int.zig"
     "math/cbrt.zig"
     "math/ceil.zig"
+    "math/complex/abs.zig"
+    "math/complex/acos.zig"
+    "math/complex/acosh.zig"
+    "math/complex/arg.zig"
+    "math/complex/asin.zig"
+    "math/complex/asinh.zig"
+    "math/complex/atan.zig"
+    "math/complex/atanh.zig"
+    "math/complex/conj.zig"
+    "math/complex/cos.zig"
+    "math/complex/cosh.zig"
+    "math/complex/exp.zig"
+    "math/complex/index.zig"
+    "math/complex/ldexp.zig"
+    "math/complex/log.zig"
+    "math/complex/pow.zig"
+    "math/complex/proj.zig"
+    "math/complex/sin.zig"
+    "math/complex/sinh.zig"
+    "math/complex/sqrt.zig"
+    "math/complex/tan.zig"
+    "math/complex/tanh.zig"
     "math/copysign.zig"
     "math/cos.zig"
     "math/cosh.zig"
@@ -479,12 +546,12 @@ set(ZIG_STD_FILES
     "math/tan.zig"
     "math/tanh.zig"
     "math/trunc.zig"
-    "math/x86_64/sqrt.zig"
     "mem.zig"
     "net.zig"
     "os/child_process.zig"
     "os/darwin.zig"
     "os/darwin_errno.zig"
+    "os/epoch.zig"
     "os/file.zig"
     "os/freebsd/errno.zig"
     "os/freebsd/index.zig"
@@ -492,15 +559,18 @@ set(ZIG_STD_FILES
     "os/get_user_id.zig"
     "os/index.zig"
     "os/linux/errno.zig"
-    "os/linux/i386.zig"
     "os/linux/index.zig"
+    "os/linux/vdso.zig"
     "os/linux/x86_64.zig"
     "os/path.zig"
+    "os/time.zig"
     "os/windows/error.zig"
     "os/windows/index.zig"
     "os/windows/util.zig"
     "os/zen.zig"
-    "rand.zig"
+    "rand/index.zig"
+    "rand/ziggurat.zig"
+    "segmented_list.zig"
     "sort.zig"
     "special/bootstrap.zig"
     "special/bootstrap_lib.zig"
@@ -510,6 +580,8 @@ set(ZIG_STD_FILES
     "special/compiler_rt/aulldiv.zig"
     "special/compiler_rt/aullrem.zig"
     "special/compiler_rt/comparetf2.zig"
+    "special/compiler_rt/divti3.zig"
+    "special/compiler_rt/extendXfYf2.zig"
     "special/compiler_rt/fixuint.zig"
     "special/compiler_rt/fixunsdfdi.zig"
     "special/compiler_rt/fixunsdfsi.zig"
@@ -520,7 +592,17 @@ set(ZIG_STD_FILES
     "special/compiler_rt/fixunstfdi.zig"
     "special/compiler_rt/fixunstfsi.zig"
     "special/compiler_rt/fixunstfti.zig"
+    "special/compiler_rt/floatunditf.zig"
+    "special/compiler_rt/floatunsitf.zig"
+    "special/compiler_rt/floatuntidf.zig"
+    "special/compiler_rt/floatuntisf.zig"
+    "special/compiler_rt/floatuntitf.zig"
+    "special/compiler_rt/floattidf.zig"
+    "special/compiler_rt/floattisf.zig"
+    "special/compiler_rt/floattitf.zig"
+    "special/compiler_rt/muloti4.zig"
     "special/compiler_rt/index.zig"
+    "special/compiler_rt/truncXfYf2.zig"
     "special/compiler_rt/udivmod.zig"
     "special/compiler_rt/udivmoddi4.zig"
     "special/compiler_rt/udivmodti4.zig"
@@ -531,7 +613,8 @@ set(ZIG_STD_FILES
     "unicode.zig"
     "zig/ast.zig"
     "zig/index.zig"
-    "zig/parser.zig"
+    "zig/parse.zig"
+    "zig/render.zig"
     "zig/tokenizer.zig"
 )
 
@@ -689,6 +772,8 @@ if(MINGW)
     set(EXE_LDFLAGS "-static -static-libgcc -static-libstdc++")
 elseif(MSVC)
     set(EXE_LDFLAGS "/STACK:16777216")
+elseif(ZIG_STATIC)
+    set(EXE_LDFLAGS "-static")
 else()
     set(EXE_LDFLAGS " ")
 endif()
@@ -726,6 +811,9 @@ target_link_libraries(zig LINK_PUBLIC
     ${EXECINFO_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
 )
+if(NOT MSVC)
+    target_link_libraries(zig LINK_PUBLIC ${LIBXML2})
+endif()
 if(ZIG_DIA_GUIDS_LIB)
     target_link_libraries(zig LINK_PUBLIC ${ZIG_DIA_GUIDS_LIB})
 endif()

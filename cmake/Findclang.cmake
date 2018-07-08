@@ -5,6 +5,7 @@
 # CLANG_FOUND
 # CLANG_INCLUDE_DIRS
 # CLANG_LIBRARIES
+# CLANG_LIBDIRS
 
 if(MSVC)
   find_package(CLANG REQUIRED CONFIG)
@@ -35,6 +36,7 @@ else()
       string(TOUPPER ${_libname_} _prettylibname_)
       find_library(CLANG_${_prettylibname_}_LIB NAMES ${_libname_}
           PATHS
+              ${CLANG_LIBDIRS}
               /usr/lib/llvm/6/lib
               /usr/lib/llvm-6.0/lib
               /usr/local/llvm60/lib
@@ -62,4 +64,4 @@ endif()
 include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(CLANG DEFAULT_MSG CLANG_LIBRARIES CLANG_INCLUDE_DIRS)
 
-mark_as_advanced(CLANG_INCLUDE_DIRS CLANG_LIBRARIES)
+mark_as_advanced(CLANG_INCLUDE_DIRS CLANG_LIBRARIES CLANG_LIBDIRS)

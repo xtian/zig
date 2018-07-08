@@ -8,13 +8,14 @@ const c = @import("c.zig");
 const builtin = @import("builtin");
 const Target = @import("target.zig").Target;
 const warn = std.debug.warn;
-const Tokenizer = std.zig.Tokenizer;
 const Token = std.zig.Token;
-const Parser = std.zig.Parser;
 const ArrayList = std.ArrayList;
+const errmsg = @import("errmsg.zig");
+const ast = std.zig.ast;
+const event = std.event;
 
 pub const Module = struct {
-    allocator: &mem.Allocator,
+    loop: *event.Loop,
     name: Buffer,
     root_src_path: ?[]const u8,
     module: llvm.ModuleRef,
@@ -54,10 +55,10 @@ pub const Module = struct {
     windows_subsystem_windows: bool,
     windows_subsystem_console: bool,
 
-    link_libs_list: ArrayList(&LinkLib),
-    libc_link_lib: ?&LinkLib,
+    link_libs_list: ArrayList(*LinkLib),
+    libc_link_lib: ?*LinkLib,
 
-    err_color: ErrColor,
+    err_color: errmsg.Color,
 
     verbose_tokenize: bool,
     verbose_ast_tree: bool,
@@ -77,6 +78,52 @@ pub const Module = struct {
 
     kind: Kind,
 
+    link_out_file: ?[]const u8,
+    events: *event.Channel(Event),
+
+    // TODO handle some of these earlier and report them in a way other than error codes
+    pub const BuildError = error{
+        OutOfMemory,
+        EndOfStream,
+        BadFd,
+        Io,
+        IsDir,
+        Unexpected,
+        SystemResources,
+        SharingViolation,
+        PathAlreadyExists,
+        FileNotFound,
+        AccessDenied,
+        PipeBusy,
+        FileTooBig,
+        SymLinkLoop,
+        ProcessFdQuotaExceeded,
+        NameTooLong,
+        SystemFdQuotaExceeded,
+        NoDevice,
+        PathNotFound,
+        NoSpaceLeft,
+        NotDir,
+        FileSystem,
+        OperationAborted,
+        IoPending,
+        BrokenPipe,
+        WouldBlock,
+        FileClosed,
+        DestinationAddressRequired,
+        DiskQuota,
+        InputOutput,
+        NoStdHandles,
+        Overflow,
+        NotSupported,
+    };
+
+    pub const Event = union(enum) {
+        Ok,
+        Fail: []errmsg.Msg,
+        Error: BuildError,
+    };
+
     pub const DarwinVersionMin = union(enum) {
         None,
         MacOS: []const u8,
@@ -89,15 +136,10 @@ pub const Module = struct {
         Obj,
     };
 
-    pub const ErrColor = enum {
-        Auto,
-        Off,
-        On,
-    };
-
     pub const LinkLib = struct {
         name: []const u8,
         path: ?[]const u8,
+
         /// the list of symbols we depend on from this lib
         symbols: ArrayList([]u8),
         provided_explicitly: bool,
@@ -109,32 +151,40 @@ pub const Module = struct {
         LlvmIr,
     };
 
-    pub fn create(allocator: &mem.Allocator, name: []const u8, root_src_path: ?[]const u8, target: &const Target,
-        kind: Kind, build_mode: builtin.Mode, zig_lib_dir: []const u8, cache_dir: []const u8) !&Module
-    {
-        var name_buffer = try Buffer.init(allocator, name);
+    pub fn create(
+        loop: *event.Loop,
+        name: []const u8,
+        root_src_path: ?[]const u8,
+        target: *const Target,
+        kind: Kind,
+        build_mode: builtin.Mode,
+        zig_lib_dir: []const u8,
+        cache_dir: []const u8,
+    ) !*Module {
+        var name_buffer = try Buffer.init(loop.allocator, name);
         errdefer name_buffer.deinit();
 
-        const context = c.LLVMContextCreate() ?? return error.OutOfMemory;
+        const context = c.LLVMContextCreate() orelse return error.OutOfMemory;
         errdefer c.LLVMContextDispose(context);
 
-        const module = c.LLVMModuleCreateWithNameInContext(name_buffer.ptr(), context) ?? return error.OutOfMemory;
+        const module = c.LLVMModuleCreateWithNameInContext(name_buffer.ptr(), context) orelse return error.OutOfMemory;
         errdefer c.LLVMDisposeModule(module);
 
-        const builder = c.LLVMCreateBuilderInContext(context) ?? return error.OutOfMemory;
+        const builder = c.LLVMCreateBuilderInContext(context) orelse return error.OutOfMemory;
         errdefer c.LLVMDisposeBuilder(builder);
 
-        const module_ptr = try allocator.create(Module);
-        errdefer allocator.destroy(module_ptr);
+        const events = try event.Channel(Event).create(loop, 0);
+        errdefer events.destroy();
 
-        *module_ptr = Module {
-            .allocator = allocator,
+        return loop.allocator.create(Module{
+            .loop = loop,
+            .events = events,
             .name = name_buffer,
             .root_src_path = root_src_path,
             .module = module,
             .context = context,
             .builder = builder,
-            .target = *target,
+            .target = target.*,
             .kind = kind,
             .build_mode = build_mode,
             .zig_lib_dir = zig_lib_dir,
@@ -173,99 +223,95 @@ pub const Module = struct {
             .link_objects = [][]const u8{},
             .windows_subsystem_windows = false,
             .windows_subsystem_console = false,
-            .link_libs_list = ArrayList(&LinkLib).init(allocator),
+            .link_libs_list = ArrayList(*LinkLib).init(loop.allocator),
             .libc_link_lib = null,
-            .err_color = ErrColor.Auto,
+            .err_color = errmsg.Color.Auto,
             .darwin_frameworks = [][]const u8{},
             .darwin_version_min = DarwinVersionMin.None,
             .test_filters = [][]const u8{},
             .test_name_prefix = null,
             .emit_file_type = Emit.Binary,
-        };
-        return module_ptr;
+            .link_out_file = null,
+        });
     }
 
-    fn dump(self: &Module) void {
+    fn dump(self: *Module) void {
         c.LLVMDumpModule(self.module);
     }
 
-    pub fn destroy(self: &Module) void {
+    pub fn destroy(self: *Module) void {
+        self.events.destroy();
         c.LLVMDisposeBuilder(self.builder);
         c.LLVMDisposeModule(self.module);
         c.LLVMContextDispose(self.context);
         self.name.deinit();
 
-        self.allocator.destroy(self);
+        self.a().destroy(self);
     }
 
-    pub fn build(self: &Module) !void {
+    pub fn build(self: *Module) !void {
         if (self.llvm_argv.len != 0) {
-            var c_compatible_args = try std.cstr.NullTerminated2DArray.fromSlices(self.allocator,
-                [][]const []const u8 { [][]const u8{"zig (LLVM option parsing)"}, self.llvm_argv, });
+            var c_compatible_args = try std.cstr.NullTerminated2DArray.fromSlices(self.a(), [][]const []const u8{
+                [][]const u8{"zig (LLVM option parsing)"},
+                self.llvm_argv,
+            });
             defer c_compatible_args.deinit();
+            // TODO this sets global state
             c.ZigLLVMParseCommandLineOptions(self.llvm_argv.len + 1, c_compatible_args.ptr);
         }
 
-        const root_src_path = self.root_src_path ?? @panic("TODO handle null root src path");
-        const root_src_real_path = os.path.real(self.allocator, root_src_path) catch |err| {
+        _ = try async<self.a()> self.buildAsync();
+    }
+
+    async fn buildAsync(self: *Module) void {
+        while (true) {
+            // TODO directly awaiting async should guarantee memory allocation elision
+            // TODO also async before suspending should guarantee memory allocation elision
+            (await (async self.addRootSrc() catch unreachable)) catch |err| {
+                await (async self.events.put(Event{ .Error = err }) catch unreachable);
+                return;
+            };
+            await (async self.events.put(Event.Ok) catch unreachable);
+        }
+    }
+
+    async fn addRootSrc(self: *Module) !void {
+        const root_src_path = self.root_src_path orelse @panic("TODO handle null root src path");
+        const root_src_real_path = os.path.real(self.a(), root_src_path) catch |err| {
             try printError("unable to get real path '{}': {}", root_src_path, err);
             return err;
         };
-        errdefer self.allocator.free(root_src_real_path);
+        errdefer self.a().free(root_src_real_path);
 
-        const source_code = io.readFileAlloc(self.allocator, root_src_real_path) catch |err| {
+        const source_code = io.readFileAlloc(self.a(), root_src_real_path) catch |err| {
             try printError("unable to open '{}': {}", root_src_real_path, err);
             return err;
         };
-        errdefer self.allocator.free(source_code);
+        errdefer self.a().free(source_code);
 
-        warn("====input:====\n");
-
-        warn("{}", source_code);
-
-        warn("====tokenization:====\n");
-        {
-            var tokenizer = Tokenizer.init(source_code);
-            while (true) {
-                const token = tokenizer.next();
-                tokenizer.dump(token);
-                if (token.id == Token.Id.Eof) {
-                    break;
-                }
-            }
-        }
-
-        warn("====parse:====\n");
-
-        var tokenizer = Tokenizer.init(source_code);
-        var parser = Parser.init(&tokenizer, self.allocator, root_src_real_path);
-        defer parser.deinit();
-
-        var tree = try parser.parse();
+        var tree = try std.zig.parse(self.a(), source_code);
         defer tree.deinit();
 
-        var stderr_file = try std.io.getStdErr();
-        var stderr_file_out_stream = std.io.FileOutStream.init(&stderr_file);
-        const out_stream = &stderr_file_out_stream.stream;
-        try parser.renderAst(out_stream, tree.root_node);
-
-        warn("====fmt:====\n");
-        try parser.renderSource(out_stream, tree.root_node);
-
-        warn("====ir:====\n");
-        warn("TODO\n\n");
-
-        warn("====llvm ir:====\n");
-        self.dump();
-        
+        //var it = tree.root_node.decls.iterator();
+        //while (it.next()) |decl_ptr| {
+        //    const decl = decl_ptr.*;
+        //    switch (decl.id) {
+        //        ast.Node.Comptime => @panic("TODO"),
+        //        ast.Node.VarDecl => @panic("TODO"),
+        //        ast.Node.UseDecl => @panic("TODO"),
+        //        ast.Node.FnDef => @panic("TODO"),
+        //        ast.Node.TestDecl => @panic("TODO"),
+        //        else => unreachable,
+        //    }
+        //}
     }
 
-    pub fn link(self: &Module, out_file: ?[]const u8) !void {
+    pub fn link(self: *Module, out_file: ?[]const u8) !void {
         warn("TODO link");
         return error.Todo;
     }
 
-    pub fn addLinkLib(self: &Module, name: []const u8, provided_explicitly: bool) !&LinkLib {
+    pub fn addLinkLib(self: *Module, name: []const u8, provided_explicitly: bool) !*LinkLib {
         const is_libc = mem.eql(u8, name, "c");
 
         if (is_libc) {
@@ -280,18 +326,21 @@ pub const Module = struct {
             }
         }
 
-        const link_lib = try self.allocator.create(LinkLib);
-        *link_lib = LinkLib {
+        const link_lib = try self.a().create(LinkLib{
             .name = name,
             .path = null,
             .provided_explicitly = provided_explicitly,
-            .symbols = ArrayList([]u8).init(self.allocator),
-        };
+            .symbols = ArrayList([]u8).init(self.a()),
+        });
         try self.link_libs_list.append(link_lib);
         if (is_libc) {
             self.libc_link_lib = link_lib;
         }
         return link_lib;
+    }
+
+    fn a(self: Module) *mem.Allocator {
+        return self.loop.allocator;
     }
 };
 

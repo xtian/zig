@@ -1,9 +1,9 @@
-![ZIG](http://ziglang.org/zig-logo.svg)
+![ZIG](https://ziglang.org/zig-logo.svg)
 
 A programming language designed for robustness, optimality, and
 clarity.
 
-[ziglang.org](http://ziglang.org)
+[ziglang.org](https://ziglang.org)
 
 ## Feature Highlights
 
@@ -55,18 +55,18 @@ that counts as "freestanding" for the purposes of this table.
 |i386         | OK           | planned | OK      | planned | planned |
 |x86_64       | OK           | OK      | OK      | OK      | planned |
 |arm          | OK           | planned | planned | N/A     | planned |
-|aarch64      | OK           | planned | planned | planned | planned |
-|bpf          | OK           | planned | planned | N/A     | planned |
-|hexagon      | OK           | planned | planned | N/A     | planned |
-|mips         | OK           | planned | planned | N/A     | planned |
-|powerpc      | OK           | planned | planned | N/A     | planned |
-|r600         | OK           | planned | planned | N/A     | planned |
-|amdgcn       | OK           | planned | planned | N/A     | planned |
-|sparc        | OK           | planned | planned | N/A     | planned |
-|s390x        | OK           | planned | planned | N/A     | planned |
-|thumb        | OK           | planned | planned | N/A     | planned |
-|spir         | OK           | planned | planned | N/A     | planned |
-|lanai        | OK           | planned | planned | N/A     | planned |
+|aarch64      | OK           | planned | N/A     | planned | planned |
+|bpf          | OK           | planned | N/A     | N/A     | planned |
+|hexagon      | OK           | planned | N/A     | N/A     | planned |
+|mips         | OK           | planned | N/A     | N/A     | planned |
+|powerpc      | OK           | planned | N/A     | N/A     | planned |
+|r600         | OK           | planned | N/A     | N/A     | planned |
+|amdgcn       | OK           | planned | N/A     | N/A     | planned |
+|sparc        | OK           | planned | N/A     | N/A     | planned |
+|s390x        | OK           | planned | N/A     | N/A     | planned |
+|thumb        | OK           | planned | N/A     | N/A     | planned |
+|spir         | OK           | planned | N/A     | N/A     | planned |
+|lanai        | OK           | planned | N/A     | N/A     | planned |
 
 ## Community
 
@@ -114,7 +114,7 @@ libc. Create demo games using Zig.
 
 ## Building
 
-[![Build Status](https://travis-ci.org/zig-lang/zig.svg?branch=master)](https://travis-ci.org/zig-lang/zig)
+[![Build Status](https://travis-ci.org/ziglang/zig.svg?branch=master)](https://travis-ci.org/ziglang/zig)
 [![Build status](https://ci.appveyor.com/api/projects/status/4t80mk2dmucrc38i/branch/master?svg=true)](https://ci.appveyor.com/project/andrewrk/zig-d3l86/branch/master)
 
 ### Stage 1: Build Zig from C++ Source Code
@@ -126,6 +126,7 @@ libc. Create demo games using Zig.
  * cmake >= 2.8.5
  * gcc >= 5.0.0 or clang >= 3.6.0
  * LLVM, Clang, LLD development libraries == 6.x, compiled with the same gcc or clang version above
+   - These depend on zlib and libxml2.
 
 ##### Windows
 
@@ -137,36 +138,30 @@ libc. Create demo games using Zig.
 
 ##### POSIX
 
-If you have gcc or clang installed, you can find out what `ZIG_LIBC_LIB_DIR`,
-`ZIG_LIBC_STATIC_LIB_DIR`, and `ZIG_LIBC_INCLUDE_DIR` should be set to
-(example below).
-
 ```
 mkdir build
 cd build
-cmake .. -DCMAKE_INSTALL_PREFIX=$(pwd) -DZIG_LIBC_LIB_DIR=$(dirname $(cc -print-file-name=crt1.o)) -DZIG_LIBC_INCLUDE_DIR=$(echo -n | cc -E -x c - -v 2>&1 | grep -B1 "End of search list." | head -n1 | cut -c 2- | sed "s/ .*//") -DZIG_LIBC_STATIC_LIB_DIR=$(dirname $(cc -print-file-name=crtbegin.o))
+cmake ..
 make
 make install
-./zig build --build-file ../build.zig test
+bin/zig build --build-file ../build.zig test
 ```
 
 ##### MacOS
-
-`ZIG_LIBC_LIB_DIR` and `ZIG_LIBC_STATIC_LIB_DIR` are unused.
 
 ```
 brew install cmake llvm@6
 brew outdated llvm@6 || brew upgrade llvm@6
 mkdir build
 cd build
-cmake .. -DCMAKE_PREFIX_PATH=/usr/local/opt/llvm@6/ -DCMAKE_INSTALL_PREFIX=$(pwd)
+cmake .. -DCMAKE_PREFIX_PATH=/usr/local/opt/llvm@6/
 make install
-./zig build --build-file ../build.zig test
+bin/zig build --build-file ../build.zig test
 ```
 
 ##### Windows
 
-See https://github.com/zig-lang/zig/wiki/Building-Zig-on-Windows
+See https://github.com/ziglang/zig/wiki/Building-Zig-on-Windows
 
 ### Stage 2: Build Self-Hosted Zig from Zig Source Code
 
@@ -186,6 +181,9 @@ binary.
 ### Stage 3: Rebuild Self-Hosted Zig Using the Self-Hosted Compiler
 
 This is the actual compiler binary that we will install to the system.
+
+*Note: Stage 2 compiler is not yet able to build Stage 3. Building Stage 3 is
+not yet supported.*
 
 #### Debug / Development Build
 

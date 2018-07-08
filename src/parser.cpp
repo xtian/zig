@@ -648,12 +648,30 @@ static AstNode *ast_parse_asm_expr(ParseContext *pc, size_t *token_index, bool m
 }
 
 /*
-SuspendExpression(body) = "suspend" "|" Symbol "|" body
+SuspendExpression(body) = option(Symbol ":") "suspend" option(("|" Symbol "|" body))
 */
 static AstNode *ast_parse_suspend_block(ParseContext *pc, size_t *token_index, bool mandatory) {
     size_t orig_token_index = *token_index;
 
-    Token *suspend_token = &pc->tokens->at(*token_index);
+    Token *name_token = nullptr;
+    Token *token = &pc->tokens->at(*token_index);
+    if (token->id == TokenIdSymbol) {
+        *token_index += 1;
+        Token *colon_token = &pc->tokens->at(*token_index);
+        if (colon_token->id == TokenIdColon) {
+            *token_index += 1;
+            name_token = token;
+            token = &pc->tokens->at(*token_index);
+        } else if (mandatory) {
+            ast_expect_token(pc, colon_token, TokenIdColon);
+            zig_unreachable();
+        } else {
+            *token_index = orig_token_index;
+            return nullptr;
+        }
+    }
+
+    Token *suspend_token = token;
     if (suspend_token->id == TokenIdKeywordSuspend) {
         *token_index += 1;
     } else if (mandatory) {
@@ -675,6 +693,9 @@ static AstNode *ast_parse_suspend_block(ParseContext *pc, size_t *token_index, b
     }
 
     AstNode *node = ast_create_node(pc, NodeTypeSuspend, suspend_token);
+    if (name_token != nullptr) {
+        node->data.suspend.name = token_buf(name_token);
+    }
     node->data.suspend.promise_symbol = ast_parse_symbol(pc, token_index);
     ast_eat_token(pc, token_index, TokenIdBinOr);
     node->data.suspend.block = ast_parse_block(pc, token_index, true);
@@ -705,7 +726,7 @@ static AstNode *ast_parse_comptime_expr(ParseContext *pc, size_t *token_index, b
 }
 
 /*
-PrimaryExpression = Integer | Float | String | CharLiteral | KeywordLiteral | GroupedExpression | BlockExpression(BlockOrExpression) | Symbol | ("@" Symbol FnCallExpression) | ArrayType | FnProto | AsmExpression | ContainerDecl | ("continue" option(":" Symbol)) | ErrorSetDecl
+PrimaryExpression = Integer | Float | String | CharLiteral | KeywordLiteral | GroupedExpression | BlockExpression(BlockOrExpression) | Symbol | ("@" Symbol FnCallExpression) | ArrayType | FnProto | AsmExpression | ContainerDecl | ("continue" option(":" Symbol)) | ErrorSetDecl | PromiseType
 KeywordLiteral = "true" | "false" | "null" | "undefined" | "error" | "this" | "unreachable" | "suspend"
 ErrorSetDecl = "error" "{" list(Symbol, ",") "}"
 */
@@ -773,6 +794,15 @@ static AstNode *ast_parse_primary_expr(ParseContext *pc, size_t *token_index, bo
     } else if (token->id == TokenIdKeywordSuspend) {
         AstNode *node = ast_create_node(pc, NodeTypeSuspend, token);
         *token_index += 1;
+        return node;
+    } else if (token->id == TokenIdKeywordPromise) {
+        AstNode *node = ast_create_node(pc, NodeTypePromiseType, token);
+        *token_index += 1;
+        Token *arrow_tok = &pc->tokens->at(*token_index);
+        if (arrow_tok->id == TokenIdArrow) {
+            *token_index += 1;
+            node->data.promise_type.payload_type = ast_parse_type_expr(pc, token_index, true);
+        }
         return node;
     } else if (token->id == TokenIdKeywordError) {
         Token *next_token = &pc->tokens->at(*token_index + 1);
@@ -955,8 +985,68 @@ static AstNode *ast_parse_curly_suffix_expr(ParseContext *pc, size_t *token_inde
     }
 }
 
+static AstNode *ast_parse_fn_proto_partial(ParseContext *pc, size_t *token_index, Token *fn_token,
+        AstNode *async_allocator_type_node, CallingConvention cc, bool is_extern, VisibMod visib_mod)
+{
+    AstNode *node = ast_create_node(pc, NodeTypeFnProto, fn_token);
+    node->data.fn_proto.visib_mod = visib_mod;
+    node->data.fn_proto.cc = cc;
+    node->data.fn_proto.is_extern = is_extern;
+    node->data.fn_proto.async_allocator_type = async_allocator_type_node;
+
+    Token *fn_name = &pc->tokens->at(*token_index);
+
+    if (fn_name->id == TokenIdSymbol) {
+        *token_index += 1;
+        node->data.fn_proto.name = token_buf(fn_name);
+    } else {
+        node->data.fn_proto.name = nullptr;
+    }
+
+    ast_parse_param_decl_list(pc, token_index, &node->data.fn_proto.params, &node->data.fn_proto.is_var_args);
+
+    Token *next_token = &pc->tokens->at(*token_index);
+    if (next_token->id == TokenIdKeywordAlign) {
+        *token_index += 1;
+        ast_eat_token(pc, token_index, TokenIdLParen);
+
+        node->data.fn_proto.align_expr = ast_parse_expression(pc, token_index, true);
+        ast_eat_token(pc, token_index, TokenIdRParen);
+        next_token = &pc->tokens->at(*token_index);
+    }
+    if (next_token->id == TokenIdKeywordSection) {
+        *token_index += 1;
+        ast_eat_token(pc, token_index, TokenIdLParen);
+
+        node->data.fn_proto.section_expr = ast_parse_expression(pc, token_index, true);
+        ast_eat_token(pc, token_index, TokenIdRParen);
+        next_token = &pc->tokens->at(*token_index);
+    }
+    if (next_token->id == TokenIdKeywordVar) {
+        node->data.fn_proto.return_var_token = next_token;
+        *token_index += 1;
+        next_token = &pc->tokens->at(*token_index);
+    } else {
+        if (next_token->id == TokenIdKeywordError) {
+            Token *maybe_lbrace_tok = &pc->tokens->at(*token_index + 1);
+            if (maybe_lbrace_tok->id == TokenIdLBrace) {
+                *token_index += 1;
+                node->data.fn_proto.return_type = ast_create_node(pc, NodeTypeErrorType, next_token);
+                return node;
+            }
+        } else if (next_token->id == TokenIdBang) {
+            *token_index += 1;
+            node->data.fn_proto.auto_err_set = true;
+            next_token = &pc->tokens->at(*token_index);
+        }
+        node->data.fn_proto.return_type = ast_parse_type_expr(pc, token_index, true);
+    }
+
+    return node;
+}
+
 /*
-SuffixOpExpression = ("async" option("(" Expression ")") PrimaryExpression FnCallExpression) | PrimaryExpression option(FnCallExpression | ArrayAccessExpression | FieldAccessExpression | SliceExpression)
+SuffixOpExpression = ("async" option("&lt;" SuffixOpExpression "&gt;") SuffixOpExpression FnCallExpression) | PrimaryExpression option(FnCallExpression | ArrayAccessExpression | FieldAccessExpression | SliceExpression | ".*" | ".?")
 FnCallExpression : token(LParen) list(Expression, token(Comma)) token(RParen)
 ArrayAccessExpression : token(LBracket) Expression token(RBracket)
 SliceExpression = "[" Expression ".." option(Expression) "]"
@@ -972,19 +1062,25 @@ static AstNode *ast_parse_suffix_op_expr(ParseContext *pc, size_t *token_index, 
 
         AstNode *allocator_expr_node = nullptr;
         Token *async_lparen_tok = &pc->tokens->at(*token_index);
-        if (async_lparen_tok->id == TokenIdLParen) {
+        if (async_lparen_tok->id == TokenIdCmpLessThan) {
             *token_index += 1;
-            allocator_expr_node = ast_parse_expression(pc, token_index, true);
-            ast_eat_token(pc, token_index, TokenIdRParen);
+            allocator_expr_node = ast_parse_prefix_op_expr(pc, token_index, true);
+            ast_eat_token(pc, token_index, TokenIdCmpGreaterThan);
         }
 
-        AstNode *fn_ref_expr_node = ast_parse_primary_expr(pc, token_index, true);
-        Token *lparen_tok = ast_eat_token(pc, token_index, TokenIdLParen);
-        AstNode *node = ast_create_node(pc, NodeTypeFnCallExpr, lparen_tok);
+        Token *fncall_token = &pc->tokens->at(*token_index);
+        if (fncall_token->id == TokenIdKeywordFn) {
+            *token_index += 1;
+            return ast_parse_fn_proto_partial(pc, token_index, fncall_token, allocator_expr_node, CallingConventionAsync,
+                    false, VisibModPrivate);
+        }
+        AstNode *node = ast_parse_suffix_op_expr(pc, token_index, true);
+        if (node->type != NodeTypeFnCallExpr) {
+            ast_error(pc, fncall_token, "expected function call, found '%s'", token_name(fncall_token->id));
+        }
         node->data.fn_call_expr.is_async = true;
         node->data.fn_call_expr.async_allocator = allocator_expr_node;
-        node->data.fn_call_expr.fn_ref_expr = fn_ref_expr_node;
-        ast_parse_fn_call_param_list(pc, token_index, &node->data.fn_call_expr.params);
+        assert(node->data.fn_call_expr.fn_ref_expr != nullptr);
 
         primary_expr = node;
     } else {
@@ -1035,13 +1131,34 @@ static AstNode *ast_parse_suffix_op_expr(ParseContext *pc, size_t *token_index, 
         } else if (first_token->id == TokenIdDot) {
             *token_index += 1;
 
-            Token *name_token = ast_eat_token(pc, token_index, TokenIdSymbol);
+            Token *token = &pc->tokens->at(*token_index);
 
-            AstNode *node = ast_create_node(pc, NodeTypeFieldAccessExpr, first_token);
-            node->data.field_access_expr.struct_expr = primary_expr;
-            node->data.field_access_expr.field_name = token_buf(name_token);
+            if (token->id == TokenIdSymbol) {
+                *token_index += 1;
 
-            primary_expr = node;
+                AstNode *node = ast_create_node(pc, NodeTypeFieldAccessExpr, first_token);
+                node->data.field_access_expr.struct_expr = primary_expr;
+                node->data.field_access_expr.field_name = token_buf(token);
+
+                primary_expr = node;
+            } else if (token->id == TokenIdStar) {
+                *token_index += 1;
+
+                AstNode *node = ast_create_node(pc, NodeTypePtrDeref, first_token);
+                node->data.ptr_deref_expr.target = primary_expr;
+
+                primary_expr = node;
+            } else if (token->id == TokenIdQuestion) {
+                *token_index += 1;
+
+                AstNode *node = ast_create_node(pc, NodeTypeUnwrapOptional, first_token);
+                node->data.unwrap_optional.expr = primary_expr;
+
+                primary_expr = node;
+            } else {
+                ast_invalid_token_error(pc, token);
+            }
+
         } else {
             return primary_expr;
         }
@@ -1054,24 +1171,21 @@ static PrefixOp tok_to_prefix_op(Token *token) {
         case TokenIdDash: return PrefixOpNegation;
         case TokenIdMinusPercent: return PrefixOpNegationWrap;
         case TokenIdTilde: return PrefixOpBinNot;
-        case TokenIdStar: return PrefixOpDereference;
-        case TokenIdMaybe: return PrefixOpMaybe;
-        case TokenIdDoubleQuestion: return PrefixOpUnwrapMaybe;
-        case TokenIdStarStar: return PrefixOpDereference;
+        case TokenIdQuestion: return PrefixOpOptional;
+        case TokenIdAmpersand: return PrefixOpAddrOf;
         default: return PrefixOpInvalid;
     }
 }
 
-static AstNode *ast_parse_addr_of(ParseContext *pc, size_t *token_index) {
-    Token *ampersand_tok = ast_eat_token(pc, token_index, TokenIdAmpersand);
-
-    AstNode *node = ast_create_node(pc, NodeTypeAddrOfExpr, ampersand_tok);
+static AstNode *ast_parse_pointer_type(ParseContext *pc, size_t *token_index, Token *star_tok) {
+    AstNode *node = ast_create_node(pc, NodeTypePointerType, star_tok);
+    node->data.pointer_type.star_token = star_tok;
 
     Token *token = &pc->tokens->at(*token_index);
     if (token->id == TokenIdKeywordAlign) {
         *token_index += 1;
         ast_eat_token(pc, token_index, TokenIdLParen);
-        node->data.addr_of_expr.align_expr = ast_parse_expression(pc, token_index, true);
+        node->data.pointer_type.align_expr = ast_parse_expression(pc, token_index, true);
 
         token = &pc->tokens->at(*token_index);
         if (token->id == TokenIdColon) {
@@ -1080,35 +1194,45 @@ static AstNode *ast_parse_addr_of(ParseContext *pc, size_t *token_index) {
             ast_eat_token(pc, token_index, TokenIdColon);
             Token *bit_offset_end_tok = ast_eat_token(pc, token_index, TokenIdIntLiteral);
 
-            node->data.addr_of_expr.bit_offset_start = token_bigint(bit_offset_start_tok);
-            node->data.addr_of_expr.bit_offset_end = token_bigint(bit_offset_end_tok);
+            node->data.pointer_type.bit_offset_start = token_bigint(bit_offset_start_tok);
+            node->data.pointer_type.bit_offset_end = token_bigint(bit_offset_end_tok);
         }
         ast_eat_token(pc, token_index, TokenIdRParen);
         token = &pc->tokens->at(*token_index);
     }
     if (token->id == TokenIdKeywordConst) {
         *token_index += 1;
-        node->data.addr_of_expr.is_const = true;
+        node->data.pointer_type.is_const = true;
 
         token = &pc->tokens->at(*token_index);
     }
     if (token->id == TokenIdKeywordVolatile) {
         *token_index += 1;
-        node->data.addr_of_expr.is_volatile = true;
+        node->data.pointer_type.is_volatile = true;
     }
 
-    node->data.addr_of_expr.op_expr = ast_parse_prefix_op_expr(pc, token_index, true);
+    node->data.pointer_type.op_expr = ast_parse_prefix_op_expr(pc, token_index, true);
     return node;
 }
 
 /*
 PrefixOpExpression = PrefixOp ErrorSetExpr | SuffixOpExpression
-PrefixOp = "!" | "-" | "~" | "*" | ("&" option("align" "(" Expression option(":" Integer ":" Integer) ")" ) option("const") option("volatile")) | "?" | "??" | "-%" | "try" | "await"
+PrefixOp = "!" | "-" | "~" | (("*" | "[*]") option("align" "(" Expression option(":" Integer ":" Integer) ")" ) option("const") option("volatile")) | "?" | "??" | "-%" | "try" | "await"
 */
 static AstNode *ast_parse_prefix_op_expr(ParseContext *pc, size_t *token_index, bool mandatory) {
     Token *token = &pc->tokens->at(*token_index);
-    if (token->id == TokenIdAmpersand) {
-        return ast_parse_addr_of(pc, token_index);
+    if (token->id == TokenIdStar || token->id == TokenIdBracketStarBracket) {
+        *token_index += 1;
+        return ast_parse_pointer_type(pc, token_index, token);
+    }
+    if (token->id == TokenIdStarStar) {
+        *token_index += 1;
+        AstNode *child_node = ast_parse_pointer_type(pc, token_index, token);
+        child_node->column += 1;
+        AstNode *parent_node = ast_create_node(pc, NodeTypePointerType, token);
+        parent_node->data.pointer_type.star_token = token;
+        parent_node->data.pointer_type.op_expr = child_node;
+        return parent_node;
     }
     if (token->id == TokenIdKeywordTry) {
         return ast_parse_try_expr(pc, token_index);
@@ -1125,22 +1249,12 @@ static AstNode *ast_parse_prefix_op_expr(ParseContext *pc, size_t *token_index, 
 
 
     AstNode *node = ast_create_node(pc, NodeTypePrefixOpExpr, token);
-    AstNode *parent_node = node;
-    if (token->id == TokenIdStarStar) {
-        // pretend that we got 2 star tokens
-
-        parent_node = ast_create_node(pc, NodeTypePrefixOpExpr, token);
-        parent_node->data.prefix_op_expr.primary_expr = node;
-        parent_node->data.prefix_op_expr.prefix_op = PrefixOpDereference;
-
-        node->column += 1;
-    }
 
     AstNode *prefix_op_expr = ast_parse_error_set_expr(pc, token_index, true);
     node->data.prefix_op_expr.primary_expr = prefix_op_expr;
     node->data.prefix_op_expr.prefix_op = prefix_op;
 
-    return parent_node;
+    return node;
 }
 
 
@@ -2195,8 +2309,8 @@ static BinOpType ast_parse_ass_op(ParseContext *pc, size_t *token_index, bool ma
 }
 
 /*
-UnwrapExpression : BoolOrExpression (UnwrapMaybe | UnwrapError) | BoolOrExpression
-UnwrapMaybe : "??" BoolOrExpression
+UnwrapExpression : BoolOrExpression (UnwrapOptional | UnwrapError) | BoolOrExpression
+UnwrapOptional = "orelse" Expression
 UnwrapError = "catch" option("|" Symbol "|") Expression
 */
 static AstNode *ast_parse_unwrap_expr(ParseContext *pc, size_t *token_index, bool mandatory) {
@@ -2206,14 +2320,14 @@ static AstNode *ast_parse_unwrap_expr(ParseContext *pc, size_t *token_index, boo
 
     Token *token = &pc->tokens->at(*token_index);
 
-    if (token->id == TokenIdDoubleQuestion) {
+    if (token->id == TokenIdKeywordOrElse) {
         *token_index += 1;
 
         AstNode *rhs = ast_parse_expression(pc, token_index, true);
 
         AstNode *node = ast_create_node(pc, NodeTypeBinOpExpr, token);
         node->data.bin_op_expr.op1 = lhs;
-        node->data.bin_op_expr.bin_op = BinOpTypeUnwrapMaybe;
+        node->data.bin_op_expr.bin_op = BinOpTypeUnwrapOptional;
         node->data.bin_op_expr.op2 = rhs;
 
         return node;
@@ -2433,9 +2547,10 @@ static AstNode *ast_parse_fn_proto(ParseContext *pc, size_t *token_index, bool m
     } else if (first_token->id == TokenIdKeywordAsync) {
         *token_index += 1;
         Token *next_token = &pc->tokens->at(*token_index);
-        if (next_token->id == TokenIdLParen) {
+        if (next_token->id == TokenIdCmpLessThan) {
+            *token_index += 1;
             async_allocator_type_node = ast_parse_type_expr(pc, token_index, true);
-            ast_eat_token(pc, token_index, TokenIdRParen);
+            ast_eat_token(pc, token_index, TokenIdCmpGreaterThan);
         }
         fn_token = ast_eat_token(pc, token_index, TokenIdKeywordFn);
         cc = CallingConventionAsync;
@@ -2469,61 +2584,7 @@ static AstNode *ast_parse_fn_proto(ParseContext *pc, size_t *token_index, bool m
         return nullptr;
     }
 
-    AstNode *node = ast_create_node(pc, NodeTypeFnProto, fn_token);
-    node->data.fn_proto.visib_mod = visib_mod;
-    node->data.fn_proto.cc = cc;
-    node->data.fn_proto.is_extern = is_extern;
-    node->data.fn_proto.async_allocator_type = async_allocator_type_node;
-
-    Token *fn_name = &pc->tokens->at(*token_index);
-
-    if (fn_name->id == TokenIdSymbol) {
-        *token_index += 1;
-        node->data.fn_proto.name = token_buf(fn_name);
-    } else {
-        node->data.fn_proto.name = nullptr;
-    }
-
-    ast_parse_param_decl_list(pc, token_index, &node->data.fn_proto.params, &node->data.fn_proto.is_var_args);
-
-    Token *next_token = &pc->tokens->at(*token_index);
-    if (next_token->id == TokenIdKeywordAlign) {
-        *token_index += 1;
-        ast_eat_token(pc, token_index, TokenIdLParen);
-
-        node->data.fn_proto.align_expr = ast_parse_expression(pc, token_index, true);
-        ast_eat_token(pc, token_index, TokenIdRParen);
-        next_token = &pc->tokens->at(*token_index);
-    }
-    if (next_token->id == TokenIdKeywordSection) {
-        *token_index += 1;
-        ast_eat_token(pc, token_index, TokenIdLParen);
-
-        node->data.fn_proto.section_expr = ast_parse_expression(pc, token_index, true);
-        ast_eat_token(pc, token_index, TokenIdRParen);
-        next_token = &pc->tokens->at(*token_index);
-    }
-    if (next_token->id == TokenIdKeywordVar) {
-        node->data.fn_proto.return_var_token = next_token;
-        *token_index += 1;
-        next_token = &pc->tokens->at(*token_index);
-    } else {
-        if (next_token->id == TokenIdKeywordError) {
-            Token *maybe_lbrace_tok = &pc->tokens->at(*token_index + 1);
-            if (maybe_lbrace_tok->id == TokenIdLBrace) {
-                *token_index += 1;
-                node->data.fn_proto.return_type = ast_create_node(pc, NodeTypeErrorType, next_token);
-                return node;
-            }
-        } else if (next_token->id == TokenIdBang) {
-            *token_index += 1;
-            node->data.fn_proto.auto_err_set = true;
-            next_token = &pc->tokens->at(*token_index);
-        }
-        node->data.fn_proto.return_type = ast_parse_type_expr(pc, token_index, true);
-    }
-
-    return node;
+    return ast_parse_fn_proto_partial(pc, token_index, fn_token, async_allocator_type_node, cc, is_extern, visib_mod);
 }
 
 /*
@@ -2901,9 +2962,6 @@ void ast_visit_node_children(AstNode *node, void (*visit)(AstNode **, void *cont
             visit_field(&node->data.fn_def.fn_proto, visit, context);
             visit_field(&node->data.fn_def.body, visit, context);
             break;
-        case NodeTypeFnDecl:
-            visit_field(&node->data.fn_decl.fn_proto, visit, context);
-            break;
         case NodeTypeParamDecl:
             visit_field(&node->data.param_decl.type, visit, context);
             break;
@@ -2971,6 +3029,12 @@ void ast_visit_node_children(AstNode *node, void (*visit)(AstNode **, void *cont
             break;
         case NodeTypeFieldAccessExpr:
             visit_field(&node->data.field_access_expr.struct_expr, visit, context);
+            break;
+        case NodeTypePtrDeref:
+            visit_field(&node->data.ptr_deref_expr.target, visit, context);
+            break;
+        case NodeTypeUnwrapOptional:
+            visit_field(&node->data.unwrap_optional.expr, visit, context);
             break;
         case NodeTypeUse:
             visit_field(&node->data.use.expr, visit, context);
@@ -3068,12 +3132,15 @@ void ast_visit_node_children(AstNode *node, void (*visit)(AstNode **, void *cont
             visit_field(&node->data.array_type.child_type, visit, context);
             visit_field(&node->data.array_type.align_expr, visit, context);
             break;
+        case NodeTypePromiseType:
+            visit_field(&node->data.promise_type.payload_type, visit, context);
+            break;
         case NodeTypeErrorType:
             // none
             break;
-        case NodeTypeAddrOfExpr:
-            visit_field(&node->data.addr_of_expr.align_expr, visit, context);
-            visit_field(&node->data.addr_of_expr.op_expr, visit, context);
+        case NodeTypePointerType:
+            visit_field(&node->data.pointer_type.align_expr, visit, context);
+            visit_field(&node->data.pointer_type.op_expr, visit, context);
             break;
         case NodeTypeErrorSetDecl:
             visit_node_list(&node->data.err_set_decl.decls, visit, context);

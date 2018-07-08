@@ -134,7 +134,9 @@ static const struct ZigKeyword zig_keywords[] = {
     {"noalias", TokenIdKeywordNoAlias},
     {"null", TokenIdKeywordNull},
     {"or", TokenIdKeywordOr},
+    {"orelse", TokenIdKeywordOrElse},
     {"packed", TokenIdKeywordPacked},
+    {"promise", TokenIdKeywordPromise},
     {"pub", TokenIdKeywordPub},
     {"resume", TokenIdKeywordResume},
     {"return", TokenIdKeywordReturn},
@@ -214,10 +216,11 @@ enum TokenizeState {
     TokenizeStateSawGreaterThanGreaterThan,
     TokenizeStateSawDot,
     TokenizeStateSawDotDot,
-    TokenizeStateSawQuestionMark,
     TokenizeStateSawAtSign,
     TokenizeStateCharCode,
     TokenizeStateError,
+    TokenizeStateLBracket,
+    TokenizeStateLBracketStar,
 };
 
 
@@ -354,12 +357,19 @@ static void end_float_token(Tokenize *t) {
             // Mask the sign bit to 0 since always non-negative lex
             const uint64_t exp_mask = 0xffffull << exp_shift;
 
-            if (shift >= 64) {
+            // must be special-cased to avoid undefined behavior on shift == 64
+            if (shift == 128) {
+                f_bits.repr[0] = 0;
+                f_bits.repr[1] = sig_bits[0];
+            } else if (shift == 0) {
+                f_bits.repr[0] = sig_bits[0];
+                f_bits.repr[1] = sig_bits[1];
+            } else if (shift >= 64) {
                 f_bits.repr[0] = 0;
                 f_bits.repr[1] = sig_bits[0] << (shift - 64);
             } else {
                 f_bits.repr[0] = sig_bits[0] << shift;
-                f_bits.repr[1] = ((sig_bits[1] << shift) | (sig_bits[0] >> (64 - shift)));
+                f_bits.repr[1] = (sig_bits[1] << shift) | (sig_bits[0] >> (64 - shift));
             }
 
             f_bits.repr[1] &= ~exp_mask;
@@ -529,6 +539,10 @@ void tokenize(Buf *buf, Tokenization *out) {
                         begin_token(&t, TokenIdComma);
                         end_token(&t);
                         break;
+                    case '?':
+                        begin_token(&t, TokenIdQuestion);
+                        end_token(&t);
+                        break;
                     case '{':
                         begin_token(&t, TokenIdLBrace);
                         end_token(&t);
@@ -538,8 +552,8 @@ void tokenize(Buf *buf, Tokenization *out) {
                         end_token(&t);
                         break;
                     case '[':
+                        t.state = TokenizeStateLBracket;
                         begin_token(&t, TokenIdLBracket);
-                        end_token(&t);
                         break;
                     case ']':
                         begin_token(&t, TokenIdRBracket);
@@ -621,31 +635,8 @@ void tokenize(Buf *buf, Tokenization *out) {
                         begin_token(&t, TokenIdDot);
                         t.state = TokenizeStateSawDot;
                         break;
-                    case '?':
-                        begin_token(&t, TokenIdMaybe);
-                        t.state = TokenizeStateSawQuestionMark;
-                        break;
                     default:
                         invalid_char_error(&t, c);
-                }
-                break;
-            case TokenizeStateSawQuestionMark:
-                switch (c) {
-                    case '?':
-                        set_token_id(&t, t.cur_tok, TokenIdDoubleQuestion);
-                        end_token(&t);
-                        t.state = TokenizeStateStart;
-                        break;
-                    case '=':
-                        set_token_id(&t, t.cur_tok, TokenIdMaybeAssign);
-                        end_token(&t);
-                        t.state = TokenizeStateStart;
-                        break;
-                    default:
-                        t.pos -= 1;
-                        end_token(&t);
-                        t.state = TokenizeStateStart;
-                        continue;
                 }
                 break;
             case TokenizeStateSawDot:
@@ -849,6 +840,30 @@ void tokenize(Buf *buf, Tokenization *out) {
                         end_token(&t);
                         t.state = TokenizeStateStart;
                         continue;
+                }
+                break;
+            case TokenizeStateLBracket:
+                switch (c) {
+                    case '*':
+                        t.state = TokenizeStateLBracketStar;
+                        set_token_id(&t, t.cur_tok, TokenIdBracketStarBracket);
+                        break;
+                    default:
+                        // reinterpret as just an lbracket
+                        t.pos -= 1;
+                        end_token(&t);
+                        t.state = TokenizeStateStart;
+                        continue;
+                }
+                break;
+            case TokenizeStateLBracketStar:
+                switch (c) {
+                    case ']':
+                        end_token(&t);
+                        t.state = TokenizeStateStart;
+                        break;
+                    default:
+                        invalid_char_error(&t, c);
                 }
                 break;
             case TokenizeStateSawPlusPercent:
@@ -1458,7 +1473,6 @@ void tokenize(Buf *buf, Tokenization *out) {
         case TokenizeStateSawGreaterThan:
         case TokenizeStateSawGreaterThanGreaterThan:
         case TokenizeStateSawDot:
-        case TokenizeStateSawQuestionMark:
         case TokenizeStateSawAtSign:
         case TokenizeStateSawStarPercent:
         case TokenizeStateSawPlusPercent:
@@ -1466,12 +1480,14 @@ void tokenize(Buf *buf, Tokenization *out) {
         case TokenizeStateLineString:
         case TokenizeStateLineStringEnd:
         case TokenizeStateSawBarBar:
+        case TokenizeStateLBracket:
             end_token(&t);
             break;
         case TokenizeStateSawDotDot:
         case TokenizeStateSawBackslash:
         case TokenizeStateLineStringContinue:
         case TokenizeStateLineStringContinueC:
+        case TokenizeStateLBracketStar:
             tokenize_error(&t, "unexpected EOF");
             break;
         case TokenizeStateLineComment:
@@ -1508,6 +1524,7 @@ const char * token_name(TokenId id) {
         case TokenIdBitShiftRight: return ">>";
         case TokenIdBitShiftRightEq: return ">>=";
         case TokenIdBitXorEq: return "^=";
+        case TokenIdBracketStarBracket: return "[*]";
         case TokenIdCharLiteral: return "CharLiteral";
         case TokenIdCmpEq: return "==";
         case TokenIdCmpGreaterOrEq: return ">=";
@@ -1520,7 +1537,6 @@ const char * token_name(TokenId id) {
         case TokenIdDash: return "-";
         case TokenIdDivEq: return "/=";
         case TokenIdDot: return ".";
-        case TokenIdDoubleQuestion: return "??";
         case TokenIdEllipsis2: return "..";
         case TokenIdEllipsis3: return "...";
         case TokenIdEof: return "EOF";
@@ -1557,7 +1573,9 @@ const char * token_name(TokenId id) {
         case TokenIdKeywordNoAlias: return "noalias";
         case TokenIdKeywordNull: return "null";
         case TokenIdKeywordOr: return "or";
+        case TokenIdKeywordOrElse: return "orelse";
         case TokenIdKeywordPacked: return "packed";
+        case TokenIdKeywordPromise: return "promise";
         case TokenIdKeywordPub: return "pub";
         case TokenIdKeywordReturn: return "return";
         case TokenIdKeywordSection: return "section";
@@ -1578,8 +1596,7 @@ const char * token_name(TokenId id) {
         case TokenIdLBrace: return "{";
         case TokenIdLBracket: return "[";
         case TokenIdLParen: return "(";
-        case TokenIdMaybe: return "?";
-        case TokenIdMaybeAssign: return "?=";
+        case TokenIdQuestion: return "?";
         case TokenIdMinusEq: return "-=";
         case TokenIdMinusPercent: return "-%";
         case TokenIdMinusPercentEq: return "-%=";
