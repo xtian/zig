@@ -41,6 +41,9 @@ typedef SSIZE_T ssize_t;
 
 #endif
 
+#if defined(ZIG_OS_FREEBSD)
+#include <sys/sysctl.h>
+#endif
 
 #if defined(__MACH__)
 #include <mach/clock.h>
@@ -1033,7 +1036,17 @@ int os_self_exe_path(Buf *out_path) {
         return 0;
     }
 #elif defined(ZIG_OS_FREEBSD)
-    return ErrorFileNotFound;
+    int mib[4];
+    mib[0] = CTL_KERN;
+    mib[1] = KERN_PROC;
+    mib[2] = KERN_PROC_PATHNAME;
+    mib[3] = -1;
+
+    buf_resize(out_path, 1024);
+    size_t cb = 1024;
+    sysctl(mib, 4, buf_ptr(out_path), &cb, nullptr, 0);
+    return 0;
+
 #endif
     return ErrorFileNotFound;
 }
