@@ -9,7 +9,7 @@ var argc_ptr: [*]usize = undefined;
 
 comptime {
     const strong_linkage = builtin.GlobalLinkage.Strong;
-    if (builtin.link_libc or builtin.os == builtin.Os.freebsd) {
+    if (builtin.link_libc) {
         @export("main", main, strong_linkage);
     } else if (builtin.os == builtin.Os.windows) {
         @export("WinMainCRTStartup", WinMainCRTStartup, strong_linkage);
