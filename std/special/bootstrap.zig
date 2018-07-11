@@ -25,19 +25,35 @@ extern fn zen_start() noreturn {
 }
 
 nakedcc fn _start() noreturn {
-    switch (builtin.arch) {
-        builtin.Arch.x86_64 => {
-            argc_ptr = asm ("lea (%%rsp), %[argc]"
-                : [argc] "=r" (-> [*]usize)
-            );
+    switch (builtin.os) {
+        builtin.Os.freebsd => switch (builtin.arch) {
+            builtin.Arch.x86_64 => {
+                argc_ptr = asm ("lea (%%rdi), %[argc]"
+                    : [argc] "=r" (-> [*]usize)
+                );
+            },
+            builtin.Arch.i386 => {
+                argc_ptr = asm ("lea (%%edi), %[argc]"
+                    : [argc] "=r" (-> [*]usize)
+                );
+            },
+            else => @compileError("unsupported arch"),
         },
-        builtin.Arch.i386 => {
-            argc_ptr = asm ("lea (%%esp), %[argc]"
-                : [argc] "=r" (-> [*]usize)
-            );
+        else => switch (builtin.arch) {
+            builtin.Arch.x86_64 => {
+                argc_ptr = asm ("lea (%%rsp), %[argc]"
+                    : [argc] "=r" (-> [*]usize)
+                );
+            },
+            builtin.Arch.i386 => {
+                argc_ptr = asm ("lea (%%esp), %[argc]"
+                    : [argc] "=r" (-> [*]usize)
+                );
+            },
+            else => @compileError("unsupported arch"),
         },
-        else => @compileError("unsupported arch"),
     }
+
     // If LLVM inlines stack variables into _start, they will overwrite
     // the command line argument data.
     @noInlineCall(posixCallMainAndExit);
